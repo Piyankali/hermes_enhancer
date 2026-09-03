@@ -2,6 +2,8 @@
 
 v0.20.7: Added async/non-blocking I/O, automatic retention pruning,
 and summary analytics aggregation.
+Enterprise upgrade: WAL, busy timeout, retry backoff, integrity check,
+skill graph persistence tables, winning workflows persistence.
 """
 
 from __future__ import annotations
@@ -10,6 +12,8 @@ import asyncio
 import sqlite3
 import json
 import os
+import time
+import logging
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
@@ -18,6 +22,7 @@ DB_PATH = os.path.expanduser("~/.hermes/federated.db")
 DEFAULT_PRUNE_THRESHOLD = 5000
 DEFAULT_RETENTION_DAYS = 14
 _EXECUTOR = ThreadPoolExecutor(max_workers=2)
+logger = logging.getLogger("hermes.enhancer.db")
 
 
 class FederatedDB:
@@ -38,13 +43,44 @@ class FederatedDB:
         """Create a new connection with WAL mode enabled."""
         conn = sqlite3.connect(self.db_path, timeout=30.0)
         conn.execute("PRAGMA journal_mode=WAL;")
-        conn.execute("PRAGMA busy_timeout=30000;")
+        conn.execute("PRAGMA busy_timeout=5000;")
         conn.execute("PRAGMA synchronous=NORMAL;")
         conn.row_factory = sqlite3.Row
         return conn
 
+    def _integrity_check(self) -> None:
+        """Run PRAGMA integrity_check on the database at startup."""
+        conn = self._get_conn()
+        try:
+            row = conn.execute("PRAGMA integrity_check;").fetchone()
+            status = row[0] if row else "unknown"
+            if status != "ok":
+                logger.error("SQLite integrity_check failed: %s", status)
+            else:
+                logger.debug("SQLite integrity_check: ok")
+        finally:
+            conn.close()
+
+    def _with_retry(self, fn, *args, **kwargs):
+        """Execute fn with exponential backoff retry on SQLITE_BUSY / OperationalError."""
+        backoffs = [0.0, 1.0, 2.0, 4.0]
+        last_exc = None
+        for delay in backoffs:
+            try:
+                if delay:
+                    time.sleep(delay)
+                return fn(*args, **kwargs)
+            except sqlite3.OperationalError as exc:
+                last_exc = exc
+                if "busy" in str(exc).lower() or "locked" in str(exc).lower():
+                    continue
+                raise
+        if last_exc is None:
+            raise RuntimeError("Database operation failed after retries")
+        raise last_exc
+
     def _ensure_initialized(self) -> None:
-        """Create sync_queue and summary_analytics tables if missing, migrate schema."""
+        """Create tables if missing, migrate schema, and run integrity check."""
         conn = self._get_conn()
         try:
             conn.executescript("""
@@ -65,11 +101,25 @@ class FederatedDB:
                     pruned_at TEXT NOT NULL,
                     PRIMARY KEY (tool, day)
                 );
+                CREATE TABLE IF NOT EXISTS skill_graph_nodes (
+                    skill TEXT PRIMARY KEY,
+                    meta TEXT,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS skill_graph_edges (
+                    src TEXT NOT NULL,
+                    dst TEXT NOT NULL,
+                    PRIMARY KEY (src, dst)
+                );
+                CREATE TABLE IF NOT EXISTS winning_workflows (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    workflow TEXT NOT NULL,
+                    score REAL NOT NULL,
+                    recorded_at TEXT NOT NULL
+                );
             """)
             conn.commit()
-            # Migrate existing tables to add new columns before creating indexes
             self._migrate(conn)
-            # Create indexes after migration so columns are guaranteed to exist
             conn.executescript("""
                 CREATE INDEX IF NOT EXISTS idx_sync_queue_timestamp
                     ON sync_queue(timestamp);
@@ -79,17 +129,16 @@ class FederatedDB:
             conn.commit()
         finally:
             conn.close()
+        self._integrity_check()
 
     def _migrate(self, conn: sqlite3.Connection) -> None:
         """Add missing columns to legacy tables and enforce summary_analytics PK."""
-        # sync_queue: add tool/anomalous if missing
         existing_cols = {row["name"] for row in conn.execute("PRAGMA table_info(sync_queue)").fetchall()}
         if "tool" not in existing_cols:
             conn.execute("ALTER TABLE sync_queue ADD COLUMN tool TEXT")
         if "anomalous" not in existing_cols:
             conn.execute("ALTER TABLE sync_queue ADD COLUMN anomalous INTEGER DEFAULT 0")
 
-        # summary_analytics: ensure PRIMARY KEY (tool, day) exists for ON CONFLICT
         sa_cols = {row["name"] for row in conn.execute("PRAGMA table_info(summary_analytics)").fetchall()}
         sa_pk = conn.execute("PRAGMA table_info(summary_analytics)").fetchall()
         has_pk = any(row["pk"] > 0 for row in sa_pk)
@@ -117,37 +166,34 @@ class FederatedDB:
                 conn.execute(insert_sql)
                 conn.execute("DROP TABLE summary_analytics_legacy")
             except Exception:
-                # If migration fails, leave legacy table; prune will no-op safely
                 pass
         conn.commit()
 
+    def _insert_sync(self, conn, payload, now, node_id, tool, anomalous):
+        return conn.execute(
+            "INSERT INTO sync_queue (payload, timestamp, node_id, tool, anomalous) VALUES (?, ?, ?, ?, ?)",
+            (json.dumps(payload, default=str), now, node_id, tool, anomalous),
+        ).lastrowid
+
     def push(self, payload: dict, node_id: str = "local") -> int:
-        """Push a telemetry event to the sync queue.
+        """Push a telemetry event to the sync queue with retry backoff."""
+        def _do_push(conn=None):
+            created_here = conn is None
+            if created_here:
+                conn = self._get_conn()
+            try:
+                now = datetime.now(timezone.utc).isoformat()
+                tool = payload.get("tool") or payload.get("tool_name") or "unknown"
+                anomalous = 1 if payload.get("anomalous") else 0
+                row_id = self._with_retry(self._insert_sync, conn, payload, now, node_id, tool, anomalous)
+                conn.commit()
+                self._maybe_prune(conn)
+                return row_id
+            finally:
+                if created_here:
+                    conn.close()
 
-        Args:
-            payload: Dictionary payload to store.
-            node_id: Node identifier.
-
-        Returns:
-            The row ID of the inserted record.
-        """
-        conn = self._get_conn()
-        try:
-            now = datetime.now(timezone.utc).isoformat()
-            tool = payload.get("tool") or payload.get("tool_name") or "unknown"
-            anomalous = 1 if payload.get("anomalous") else 0
-            cursor = conn.execute(
-                "INSERT INTO sync_queue (payload, timestamp, node_id, tool, anomalous) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (json.dumps(payload, default=str), now, node_id, tool, anomalous),
-            )
-            conn.commit()
-            row_id = cursor.lastrowid
-            # Opportunistic pruning after insert
-            self._maybe_prune(conn)
-            return row_id
-        finally:
-            conn.close()
+        return self._with_retry(_do_push)
 
     def _maybe_prune(self, conn: sqlite3.Connection) -> None:
         """Aggregate old records and prune if threshold exceeded."""
@@ -174,10 +220,7 @@ class FederatedDB:
                 success_rate = excluded.success_rate,
                 pruned_at = excluded.pruned_at
         """, (datetime.now(timezone.utc).isoformat(), cutoff_iso))
-        conn.execute(
-            "DELETE FROM sync_queue WHERE timestamp < ?",
-            (cutoff_iso,),
-        )
+        conn.execute("DELETE FROM sync_queue WHERE timestamp < ?", (cutoff_iso,))
         conn.commit()
 
     def prune(self) -> dict[str, Any]:
@@ -205,10 +248,7 @@ class FederatedDB:
                     success_rate = excluded.success_rate,
                     pruned_at = excluded.pruned_at
             """, (datetime.now(timezone.utc).isoformat(), cutoff_iso))
-            deleted = int(conn.execute(
-                "DELETE FROM sync_queue WHERE timestamp < ?",
-                (cutoff_iso,),
-            ).rowcount or 0)
+            deleted = int(conn.execute("DELETE FROM sync_queue WHERE timestamp < ?", (cutoff_iso,)).rowcount or 0)
             conn.commit()
             after_count = conn.execute("SELECT COUNT(*) FROM sync_queue").fetchone()[0]
             return {

@@ -21,6 +21,8 @@ import json
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SRC_DIR = REPO_ROOT / "src"
 
@@ -186,6 +188,7 @@ def test_success_definition_empty_result() -> None:
     assert enhancer._is_empty_result("ok") is False
 
 
+@pytest.mark.asyncio
 async def test_async_db_insert_and_count() -> None:
     tmp_db, tmp_dir = _make_tmp_db()
     try:
@@ -198,6 +201,7 @@ async def test_async_db_insert_and_count() -> None:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
+@pytest.mark.asyncio
 async def test_async_concurrent_writes() -> None:
     tmp_db, tmp_dir = _make_tmp_db()
     try:

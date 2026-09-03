@@ -254,6 +254,7 @@ class HermesEnhancer:
             anomalous=anomalous,
         )
         self.preload.record(tool_name)
+        self.preload.maybe_cleanup()
         self.meta_learner.ingest({
             "tool": tool_name,
             "success": is_success,
