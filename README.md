@@ -2,10 +2,10 @@
 
 [![Python 3.x](https://img.shields.io/badge/python-3.x-blue)](https://www.python.org/)
 [![Hermes Agent v0.20.6+](https://img.shields.io/badge/Hermes_Agent-v0.20.6%2B-green)](https://github.com/NousResearch/hermes-agent)
-[![Platform Termux/Android](https://img.shields.io/badge/platform-Termux%2FAndroid-lightgrey)](https://f-droid.org/en/packages/com.termux/)
+[![platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows%20%7C%20Termux-orange)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-> **Autonomous self-healing middleware for Hermes Agent** with microsecond-accurate telemetry, predictive preloading, meta-learning optimization, and federated analytics. Engineered for Android/Termux environments.
+> **Autonomous self-healing middleware for Hermes Agent** with microsecond-accurate telemetry, predictive preloading, meta-learning optimization, and federated analytics. Designed for cross-platform execution (Linux, macOS, Windows, Android/Termux).
 
 ---
 
