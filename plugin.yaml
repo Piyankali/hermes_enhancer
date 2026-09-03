@@ -1,0 +1,6 @@
+name: hermes_enhancer
+version: 0.1.0
+description: "Self-healing and telemetry plugin for Hermes."
+provides_hooks:
+  - pre_tool_call
+  - post_tool_call
