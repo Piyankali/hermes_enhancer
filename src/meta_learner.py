@@ -1,6 +1,6 @@
 """MetaLearner - History optimizer with workflow persistence.
 
-v0.20.7 enterprise: persist winning execution paths into SQLite.
+v0.21.0-dev: Bounded history, workflow summary, cold/warm separation.
 """
 
 from __future__ import annotations

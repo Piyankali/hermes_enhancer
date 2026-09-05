@@ -105,6 +105,7 @@ def test_anomalous_flagging() -> None:
 
 def test_enhancer_anomalous_flagging() -> None:
     tmp_db, tmp_dir = _make_tmp_db()
+    enhancer = None
     try:
         _, _, HermesEnhancer_local = _setup_hermes_package()
         enhancer = HermesEnhancer_local(node_id="test")
@@ -113,14 +114,18 @@ def test_enhancer_anomalous_flagging() -> None:
         enhancer.pre_tool_call(("terminal",), {"tool": "terminal"})
         time.sleep(0.001)
         enhancer.on_post_tool_call(result="ok", tool_name="terminal", status="success", duration_ms=5)
+        enhancer.db.flush()
         payload = enhancer.db.get_recent(1)[0]["payload"]
         assert payload.get("anomalous", 0) == 0
         enhancer.pre_tool_call(("terminal",), {"tool": "terminal"})
         enhancer.on_post_tool_call(result="slow", tool_name="terminal", status="success", duration_ms=9999999)
+        enhancer.db.flush()
         payload = enhancer.db.get_recent(1)[0]["payload"]
         assert payload.get("anomalous", 0) == 1
         assert payload["success"] is False
     finally:
+        if enhancer is not None:
+            enhancer.db.shutdown()
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
@@ -194,6 +199,7 @@ async def test_async_db_insert_and_count() -> None:
     try:
         db = FederatedDB(db_path=str(tmp_db))
         await db.async_push({"tool": "async_terminal", "duration": 0.1, "success": True}, node_id="test")
+        db.flush()
         assert await db.async_count() == 1
         recent = await db.async_get_recent(limit=1)
         assert recent[0]["payload"]["tool"] == "async_terminal"
@@ -210,6 +216,7 @@ async def test_async_concurrent_writes() -> None:
             db.async_push({"tool": "concurrent", "duration": 0.1, "success": True}, node_id="test")
             for _ in range(20)
         ])
+        db.flush()
         assert await db.async_count() == 20
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)

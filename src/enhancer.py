@@ -1,35 +1,27 @@
 """HermesEnhancer - Core orchestrator for self-healing and telemetry architecture.
 
-v0.20.7: Async/non-blocking DB writes, anomalous duration flagging, and EMA
-duration filtering hooks.
+v0.21.0-dev: Batched telemetry persistence, event/trace IDs, lifecycle
+accounting, memory retention monitoring, and targeted cleanup hooks.
 """
 
+from __future__ import annotations
+
+import gc
+import logging
 import os
 import sys
 import time
-import asyncio
 import tracemalloc
-import logging
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-try:
-    from .federated_db import get_db, FederatedDB
-    from .self_test import SelfTestEngine
-    from .feedback_optimizer import FeedbackOptimizer
-    from .predictive_preload import PredictivePreload
-    from .meta_learner import MetaLearner
-    from .skill_graph import SkillGraph
-    from .composer import SkillComposer
-except ImportError:
-    from federated_db import get_db, FederatedDB
-    from self_test import SelfTestEngine
-    from feedback_optimizer import FeedbackOptimizer
-    from predictive_preload import PredictivePreload
-    from meta_learner import MetaLearner
-    from skill_graph import SkillGraph
-    from composer import SkillComposer
-
+from .federated_db import get_db, FederatedDB
+from .self_test import SelfTestEngine
+from .feedback_optimizer import FeedbackOptimizer
+from .predictive_preload import PredictivePreload
+from .meta_learner import MetaLearner
+from .skill_graph import SkillGraph
+from .composer import SkillComposer
 
 logger = logging.getLogger("hermes.enhancer")
 if not logger.handlers:
@@ -56,13 +48,18 @@ class HermesEnhancer:
         self._enabled = True
         self._start_times: Dict[str, float] = {}
 
-        # Memory leak protection baseline
+        self._trace_id: Optional[str] = None
+        self._tool_call_id: Optional[str] = None
+
         tracemalloc.start()
         self._baseline_snapshot = tracemalloc.take_snapshot()
+        self._last_memory_snapshot_bytes = 0
 
+    # ------------------------------------------------------------------ #
+    # Helpers
+    # ------------------------------------------------------------------ #
     @staticmethod
     def _is_empty_result(value: Any) -> bool:
-        """Return True when a result carries no meaningful execution output."""
         if value is None:
             return True
         if isinstance(value, str) and not value.strip():
@@ -74,20 +71,11 @@ class HermesEnhancer:
         return False
 
     def _normalize_tool_key(self, tool_name: str) -> str:
-        """Normalize a tool identifier for stable pre/post lookup."""
         if not tool_name:
             return "unknown"
         return str(tool_name).strip().lower()
 
     def _extract_tool_name(self, args: tuple, kwargs: Dict[str, Any]) -> str:
-        """Extract the best tool name from positional args and kwargs.
-
-        Hermes v0.20.6 passes tool context through multiple possible shapes:
-        - args[0] / args[1] containing the function name
-        - kwargs['tool'] / kwargs['name']
-        - kwargs['args'] or kwargs['function_args'] embedding a name
-        - nested dicts under keys like 'context', 'execution', 'request'
-        """
         candidates: List[str] = []
 
         def _coerce_str(value: Any) -> Optional[str]:
@@ -101,7 +89,6 @@ class HermesEnhancer:
                 return text if text else None
             return None
 
-        # Positional args: only use if they are primitive strings/numbers
         if args:
             for index in (0, 1):
                 if index < len(args):
@@ -109,14 +96,22 @@ class HermesEnhancer:
                     if text:
                         candidates.append(text)
 
-        # Top-level kwargs
         for key in ("tool", "name", "tool_name", "function_name"):
             text = _coerce_str(kwargs.get(key))
             if text:
                 candidates.append(text)
 
-        # Nested kwargs
-        nested_keys = ("args", "function_args", "arguments", "params", "payload", "context", "execution", "request", "call")
+        nested_keys = (
+            "args",
+            "function_args",
+            "arguments",
+            "params",
+            "payload",
+            "context",
+            "execution",
+            "request",
+            "call",
+        )
         for key in nested_keys:
             value = kwargs.get(key)
             if isinstance(value, dict):
@@ -130,7 +125,6 @@ class HermesEnhancer:
         return "unknown"
 
     def _extract_result(self, args: tuple, kwargs: Dict[str, Any]) -> Any:
-        """Extract the tool result from positional args or kwargs."""
         if args:
             return args[0]
         for key in ("result", "output", "response", "value"):
@@ -139,7 +133,6 @@ class HermesEnhancer:
         return None
 
     def _extract_duration_ms(self, kwargs: Dict[str, Any]) -> int:
-        """Extract duration in milliseconds from kwargs if provided."""
         for key in ("duration_ms", "duration", "elapsed_ms", "elapsed"):
             value = kwargs.get(key)
             if value is not None:
@@ -150,7 +143,6 @@ class HermesEnhancer:
         return 0
 
     def _flag_anomalous(self, duration_s: float) -> bool:
-        """Return True if duration is anomalous."""
         if duration_s <= 0:
             return True
         if duration_s > 300:
@@ -158,16 +150,103 @@ class HermesEnhancer:
         return False
 
     def _maybe_schedule_io(self, coro):
-        """Schedule DB write on executor if async loop is running; else run sync."""
         try:
             loop = asyncio.get_running_loop()
             if loop.is_running():
                 return loop.run_in_executor(_IO_EXECUTOR, coro)
         except RuntimeError:
             pass
-        # Fallback: fire-and-forget via executor when no loop is running
         return _IO_EXECUTOR.submit(coro)
 
+    # ------------------------------------------------------------------ #
+    # Targeted cleanup
+    # ------------------------------------------------------------------ #
+    def cleanup_completed_tasks(self) -> Dict[str, int]:
+        removed = 0
+        for key in list(self._start_times.keys()):
+            if key.startswith("__completed__"):
+                self._start_times.pop(key, None)
+                removed += 1
+        return {"removed_start_times": removed}
+
+    def cleanup_old_history(self, keep_last: int = 1000) -> Dict[str, int]:
+        return {
+            "pruned_meta_learner": self.meta_learner.prune(keep_last=keep_last),
+        }
+
+    def cleanup_preload_cache(self) -> Dict[str, int]:
+        if len(self.preload.last_sequence) > 0 or self.preload.transitions:
+            self.preload.clear()
+            return {"preload_cleared": 1}
+        return {"preload_cleared": 0}
+
+    def self_heal_memory(self) -> Dict[str, Any]:
+        report = {
+            "triggered": False,
+            "steps": [],
+            "baseline_bytes": self._last_memory_snapshot_bytes,
+            "final_bytes": 0,
+        }
+        try:
+            snapshot = tracemalloc.take_snapshot()
+            current = sum(s.size for s in snapshot.compare_to(self._baseline_snapshot, "lineno") if s.size_diff > 0)
+            report["baseline_bytes"] = self._last_memory_snapshot_bytes
+            report["current_bytes"] = current
+            if current > 50 * 1024 * 1024:
+                report["triggered"] = True
+                report["steps"].append("cleanup_completed_tasks")
+                report.update(self.cleanup_completed_tasks())
+                report["steps"].append("cleanup_old_history")
+                report.update(self.cleanup_old_history())
+                report["steps"].append("cleanup_preload_cache")
+                report.update(self.cleanup_preload_cache())
+                report["steps"].append("gc_collect")
+                collected = gc.collect()
+                report["gc_collected"] = collected
+                after = tracemalloc.take_snapshot()
+                after_total = sum(s.size for s in after.compare_to(self._baseline_snapshot, "lineno") if s.size_diff > 0)
+                report["final_bytes"] = after_total
+        except Exception as exc:
+            logger.debug("Memory self-heal check failed: %s", exc)
+        return report
+
+    def health_report(self) -> Dict[str, Any]:
+        memory = self.self_heal_memory()
+        return {
+            "node_id": self.node_id,
+            "enabled": self._enabled,
+            "db": {
+                "available": os.path.exists(self.db.db_path),
+                "count": self.db.count(),
+                "counters": self.db.get_counters(),
+            },
+            "self_test": self.self_test.run_battery(),
+            "feedback": self.feedback.summary(),
+            "preload": {"history_len": len(self.preload.last_sequence)},
+            "meta_learner": self.meta_learner.summary(),
+            "skill_graph": self.skill_graph.summary(),
+            "composer": {"steps": len(self.composer.steps), "results": len(self.composer.results)},
+            "memory": memory,
+        }
+
+    def check_memory_leak(self) -> Dict[str, Any]:
+        current_snapshot = tracemalloc.take_snapshot()
+        top_stats = current_snapshot.compare_to(self._baseline_snapshot, "lineno")
+        leaks = [s for s in top_stats if s.size_diff > 0][:20]
+        return {
+            "top_deltas": [
+                {
+                    "file": stat.traceback[0].filename,
+                    "line": stat.traceback[0].lineno,
+                    "delta_bytes": stat.size_diff,
+                }
+                for stat in leaks
+            ]
+        }
+
+    # ------------------------------------------------------------------ #
+    # Hooks
+    # ------------------------------------------------------------------ #
     def pre_tool_call(self, args: tuple, kwargs: Dict[str, Any]) -> Dict[str, Any]:
         """Pre-tool hook: capture state and start timing."""
         if not self._enabled:
@@ -176,6 +255,10 @@ class HermesEnhancer:
         tool_name = self._extract_tool_name(args, kwargs)
         key = self._normalize_tool_key(tool_name)
         self._start_times[key] = t0
+
+        self._trace_id = kwargs.get("trace_id") or self.db._generate_trace_id()
+        self._tool_call_id = kwargs.get("tool_call_id") or ""
+
         payload = {
             "hook": "pre_tool_call",
             "tool": tool_name,
@@ -183,10 +266,13 @@ class HermesEnhancer:
             "kwargs": kwargs,
             "node_id": self.node_id,
             "t0_us": int(t0 * 1_000_000),
+            "event_id": self.db._generate_event_id(),
+            "trace_id": self._trace_id,
+            "tool_call_id": self._tool_call_id,
         }
-        self._maybe_schedule_io(lambda: self.db.push(payload, node_id=self.node_id))
+        self.db.enqueue_event(payload, node_id=self.node_id, event_id=payload["event_id"], trace_id=payload["trace_id"], tool_call_id=payload["tool_call_id"])
         logger.debug("Pre tool hook: %s", tool_name)
-        return {"_enhancer_t0": t0, "_enhancer_tool": tool_name}
+        return {"_enhancer_t0": t0, "_enhancer_tool": tool_name, "_enhancer_trace_id": self._trace_id, "_enhancer_event_id": payload["event_id"]}
 
     def on_post_tool_call(self, *args: Any, **kwargs: Any) -> None:
         """Post-tool hook: capture duration, outcome, and push telemetry."""
@@ -233,6 +319,10 @@ class HermesEnhancer:
         if anomalous:
             is_success = False
 
+        event_id = self.db._generate_event_id()
+        trace_id = kwargs.get("trace_id") or self._trace_id or self.db._generate_trace_id()
+        tool_call_id = kwargs.get("tool_call_id") or self._tool_call_id or ""
+
         payload = {
             "hook": "post_tool_call",
             "tool": tool_name,
@@ -242,10 +332,14 @@ class HermesEnhancer:
             "delta_us": delta_us,
             "node_id": self.node_id,
             "anomalous": 1 if anomalous else 0,
+            "event_id": event_id,
+            "trace_id": trace_id,
+            "tool_call_id": tool_call_id,
         }
         if error_message:
             payload["error"] = str(error_message)
-        self._maybe_schedule_io(lambda p=payload, n=self.node_id: self.db.push(p, node_id=n))
+
+        self.db.enqueue_event(payload, node_id=self.node_id, event_id=event_id, trace_id=trace_id, tool_call_id=tool_call_id)
 
         self.feedback.record_outcome(
             tool_name,
@@ -262,41 +356,12 @@ class HermesEnhancer:
             "anomalous": 1 if anomalous else 0,
         })
 
-        logger.debug("Post tool hook: %s success=%s dt=%dms anomalous=%s",
-                     tool_name, is_success, duration_ms, anomalous)
+        logger.debug(
+            "Post tool hook: %s success=%s dt=%dms anomalous=%s trace=%s event=%s",
+            tool_name, is_success, duration_ms, anomalous, trace_id, event_id,
+        )
 
     def run_self_test(self) -> Dict[str, Any]:
-        """Run the self-test battery and return results."""
         battery = self.self_test.run_battery()
-        self._maybe_schedule_io(lambda: self.db.push({"event": "self_test", "result": battery}, node_id=self.node_id))
+        self.db.enqueue_event({"event": "self_test", "result": battery}, node_id=self.node_id)
         return battery
-
-    def health_report(self) -> Dict[str, Any]:
-        """Generate a structured health report for all components."""
-        return {
-            "node_id": self.node_id,
-            "enabled": self._enabled,
-            "db": {"available": os.path.exists(self.db.db_path), "count": self.db.count()},
-            "self_test": self.self_test.run_battery(),
-            "feedback": self.feedback.summary(),
-            "preload": {"history_len": len(self.preload.last_sequence)},
-            "meta_learner": self.meta_learner.summary(),
-            "skill_graph": self.skill_graph.summary(),
-            "composer": {"steps": len(self.composer.steps), "results": len(self.composer.results)},
-        }
-
-    def check_memory_leak(self) -> Dict[str, Any]:
-        """Compare current memory usage against baseline."""
-        current_snapshot = tracemalloc.take_snapshot()
-        top_stats = current_snapshot.compare_to(self._baseline_snapshot, "lineno")
-        leaks = [s for s in top_stats if s.size_diff > 0][:20]
-        return {
-            "top_deltas": [
-                {
-                    "file": stat.traceback[0].filename,
-                    "line": stat.traceback[0].lineno,
-                    "delta_bytes": stat.size_diff,
-                }
-                for stat in leaks
-            ]
-        }

@@ -1,8 +1,21 @@
+# Python Bytecode / Compiled files
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
-*.db
+*.py[cod]
+*$py.class
+
+# Runtime Local Databases
+database/*.db
+*.sqlite
 *.sqlite3
-database/
+
+# Diagnostic / Scratch Scripts
+_diag_*.py
+
+# Benchmark Raw Data Artifacts (Saved locally)
+results/*.json
+results/*.csv
+results/benchmark.md
+
+# OS / System Junk
+.DS_Store
 *.log
