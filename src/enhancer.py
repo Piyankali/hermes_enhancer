@@ -76,6 +76,21 @@ class HermesEnhancer:
             return "unknown"
         return str(tool_name).strip().lower()
 
+    @staticmethod
+    def _timing_key(tool_name: str, tool_call_id: Any = None) -> str:
+        """Identity-safe key for pairing pre/post timing.
+
+        Prefers a non-empty tool_call_id so concurrent calls to the same
+        tool do not overwrite each other's start timestamp; falls back to
+        the normalized tool name for callers without a call identity
+        (sequential behavior unchanged).
+        """
+        if isinstance(tool_call_id, str) and tool_call_id.strip():
+            return "call:" + tool_call_id.strip()
+        if not tool_name:
+            return "unknown"
+        return str(tool_name).strip().lower()
+
     def _extract_tool_name(self, args: tuple, kwargs: Dict[str, Any]) -> str:
         candidates: List[str] = []
 
@@ -254,7 +269,7 @@ class HermesEnhancer:
             return {}
         t0 = time.perf_counter()
         tool_name = self._extract_tool_name(args, kwargs)
-        key = self._normalize_tool_key(tool_name)
+        key = self._timing_key(tool_name, kwargs.get("tool_call_id"))
         self._start_times[key] = t0
 
         self._trace_id = kwargs.get("trace_id") or self.db._generate_trace_id()
@@ -280,7 +295,7 @@ class HermesEnhancer:
         if not self._enabled:
             return
         tool_name = kwargs.get("tool_name") or self._extract_tool_name(args, kwargs)
-        key = self._normalize_tool_key(tool_name)
+        key = self._timing_key(tool_name, kwargs.get("tool_call_id"))
         t0 = self._start_times.pop(key, None)
         if t0 is None:
             t1 = time.perf_counter()

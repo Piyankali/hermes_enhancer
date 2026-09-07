@@ -75,6 +75,7 @@ def register(ctx) -> None:
             pre_state=pre_state,
             result=result,
             error=RuntimeError(error_message) if error_message else None,
+            tool_call_id=tool_call_id,
         )
 
     ctx.register_hook("pre_tool_call", _on_pre_tool_call)

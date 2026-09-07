@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# setup.sh - Hermes Enhancer v0.22.1 plugin installer.
+# setup.sh - Hermes Enhancer v0.22.2 plugin installer.
 #
 # Installs Hermes Enhancer into the Hermes user plugin directory without
 # requiring manual file copies or configuration edits.
@@ -20,7 +20,7 @@
 #                    (e.g. Hermes CLI not installed)
 set -euo pipefail
 
-EXPECTED_VERSION="0.22.1"
+EXPECTED_VERSION="0.22.2"
 PLUGIN_ID="hermes_enhancer"
 
 # [1/6] Locate repository root (directory containing this script).

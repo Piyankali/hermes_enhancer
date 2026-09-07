@@ -4,13 +4,13 @@
 ![Hermes Agent](https://img.shields.io/badge/Hermes_Agent-v0.21.0-tested-green)
 ![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20Termux-orange)
 ![License](https://img.shields.io/badge/License-MIT-yellow)
-![Tests](https://img.shields.io/badge/tests-57_tracked_(49_core_%2B_8_installer)-brightgreen)
+![Tests](https://img.shields.io/badge/tests-66_tracked_(58_core_%2B_8_installer)-brightgreen)
 
 > **Self-healing telemetry middleware for Hermes Agent** — it records tool
 > executions, learns from outcomes, predicts likely next tools, and persists
 > telemetry through a crash-safe event buffer with automatic startup recovery.
 
-**Version:** `0.22.1`
+**Version:** `0.22.2`
 **Status:** Beta (process-crash/restart durability validated; power-loss
 durability is not claimed — see [Failure boundaries](#failure-boundaries))
 **Python:** 3.10+
@@ -86,8 +86,8 @@ workflows, not generic benchmarks.
 
 | Item | Value | Source |
 |---|---|---|
-| Plugin version | `0.22.1` | `plugin.yaml` |
-| Installer gate | `0.22.1` (`EXPECTED_VERSION`) | `setup.sh` |
+| Plugin version | `0.22.2` | `plugin.yaml` |
+| Installer gate | `0.22.2` (`EXPECTED_VERSION`) | `setup.sh` |
 | Status | Beta | this release |
 | Python | 3.10+ | `setup.sh` byte-compile / test runs |
 | Hermes | Tested against Hermes Agent **v0.21.0** CLI | `results/v0.22_installer_validation.md` |
@@ -623,7 +623,7 @@ Stage plugin files (exact runtime set, temp staging dir)
       ↓
 Install hermes_enhancer (atomic replace; old tree backed up, never merged)
       ↓
-Verify installation (files, version 0.22.1, byte-compile out of tree)
+Verify installation (files, version 0.22.2, byte-compile out of tree)
       ↓
 Verify Hermes plugin discovery (hermes plugins list)
       ↓
@@ -633,12 +633,12 @@ Plugin ready
 Step by step (verified against `setup.sh` source):
 
 1. **Project check** — all 11 required files must exist; `plugin.yaml`
-   must report `0.22.1` or the installer aborts.
+   must report `0.22.2` or the installer aborts.
 2. **Hermes home detection** — `$HERMES_HOME`, default `$HOME/.hermes`;
    plugin destination `$HERMES_HOME/plugins/hermes_enhancer`.
 3. **Staging** — the nine `src/*.py` modules plus `plugin.yaml` and
    `README.md` are copied to a temp staging dir (same filesystem for an
-   atomic move) and re-checked for version `0.22.1`. `scripts/stats.py`,
+   atomic move) and re-checked for version `0.22.2`. `scripts/stats.py`,
    tests, benchmarks, caches, and VCS metadata are never staged.
 4. **Atomic install** — an existing tree is moved to a timestamped backup
    (`.hermes_enhancer.bak.YYYYMMDD_HHMMSS`, never merged, never deleted),
@@ -694,13 +694,13 @@ backup directory printed during installation if needed.
 ```bash
 hermes plugins list --plain | grep hermes_enhancer
 hermes plugins show hermes_enhancer
-cat ~/.hermes/plugins/hermes_enhancer/plugin.yaml   # version: 0.22.1
+cat ~/.hermes/plugins/hermes_enhancer/plugin.yaml   # version: 0.22.2
 ls ~/.hermes/plugins/hermes_enhancer/                # 9 .py modules + plugin.yaml + README.md
 ```
 
 `setup.sh` already performs all of these checks and prints
 `Plugin installation: PASS` / `Plugin discovery: PASS` /
-`Plugin version: 0.22.1` — only those lines count as verified success.
+`Plugin version: 0.22.2` — only those lines count as verified success.
 
 ---
 
@@ -793,10 +793,10 @@ pip install pytest pytest-asyncio   # test dependencies only
 python3 -m pytest tests -q
 ```
 
-57 tracked tests across 11 files: **49 core validation + 8 installer**
+66 tracked tests across 12 files: **58 core validation + 8 installer**
 (the 8 installer tests execute the real scripts against fake
 `HERMES_HOME`s and take ~10 s; they were run separately at release, not
-in the same command as the 49).
+in the same command as the 58).
 
 | Suite | Tests | Proves |
 |---|---|---|
@@ -804,6 +804,8 @@ in the same command as the 49).
 | `test_v022_corruption.py` | 6 | health-check paths |
 | `test_v022_malformed_buffer.py` | 6 | quarantine without loss |
 | `test_v022_async.py` | 4 | async buffer integration |
+| `test_v022_async_hook_regression.py` | 3 | asyncio import + hook timing lock-in |
+| `test_v022_concurrent_timing.py` | 6 | same/different-tool overlap, failure path, fallback |
 | `test_v022_startup_recovery.py` | 5 | automatic bounded recovery |
 | `test_v022_crash_recovery.py` | 4 | `os._exit` crash durability |
 | `test_v022_failure_injection.py` | 6 | lock/tx/buffer/corrupt/dupe/worker |
@@ -811,7 +813,7 @@ in the same command as the 49).
 | `test_v022_storage_failure.py` | 3 | simulated ENOSPC + unwritable dir |
 | `test_v022_multiprocess.py` | 1 | 4 processes x 1500 writes |
 | `test_v022_installer.py` | 8 | setup/uninstall end-to-end (fake homes) |
-| **Total** | **57** | **49 core + 8 installer** |
+| **Total** | **66** | **58 core + 8 installer** |
 
 `tests/crash_child.py` is a crash/multiprocess child driver, not a test.
 Note: bare root `pytest` also collects `src/self_test.py`, which fails
@@ -943,7 +945,7 @@ directory itself — not `src.*` submodules.
 
 **Version mismatch.** Compare `cat plugin.yaml` (repo) with
 `cat ~/.hermes/plugins/hermes_enhancer/plugin.yaml` (installed); both
-must read `0.22.1`. Re-run `bash setup.sh` to reconcile.
+must read `0.22.2`. Re-run `bash setup.sh` to reconcile.
 
 ---
 
@@ -969,7 +971,7 @@ Tracked files only (`git ls-files`):
 
 ```text
 hermes_enhancer/
-├── plugin.yaml                  # name, version 0.22.1, hooks
+├── plugin.yaml                  # name, version 0.22.2, hooks
 ├── README.md                    # this file
 ├── LICENSE
 ├── .gitignore
@@ -987,10 +989,10 @@ hermes_enhancer/
 │   └── self_test.py
 ├── scripts/
 │   └── stats.py                 # repo-only telemetry inspector (not installed)
-├── tests/                       # 11 tracked files
+├── tests/                       # 13 tracked files
 │   ├── crash_child.py           # crash/multiprocess child driver (not a test)
 │   ├── test_pipeline.py         # 9 core regression
-│   └── test_v022_*.py           # 9 suites, 40 tests
+│   └── test_v022_*.py           # 12 suites, 57 tests
 ├── benchmarks/                  # v0.20.7-era micro-benchmark suite
 │   ├── benchmark.py
 │   ├── README.md
