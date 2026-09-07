@@ -52,9 +52,9 @@ python3 benchmarks/benchmark.py \
 
 ## Test the suite
 
-```bash
-python3 -m pytest tests/test_benchmark_suite.py
-```
+The legacy `tests/test_benchmark_suite.py` wrapper was retired; run the
+benchmark directly (see above). This suite is historical v0.20.7-era
+material and is not part of v0.22 validation.
 
 ## Benchmark protocol
 

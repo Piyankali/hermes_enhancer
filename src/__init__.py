@@ -3,14 +3,14 @@
 import time
 from typing import Any, Callable, Dict, Optional
 
-from .enhancer import HermesEnhancer
-from .federated_db import get_db, FederatedDB
-from .self_test import SelfTestEngine
-from .feedback_optimizer import FeedbackOptimizer
-from .predictive_preload import PredictivePreload
-from .meta_learner import MetaLearner
-from .skill_graph import SkillGraph
-from .composer import SkillComposer
+from enhancer import HermesEnhancer
+from federated_db import get_db, FederatedDB
+from self_test import SelfTestEngine
+from feedback_optimizer import FeedbackOptimizer
+from predictive_preload import PredictivePreload
+from meta_learner import MetaLearner
+from skill_graph import SkillGraph
+from composer import SkillComposer
 
 _instance: Optional[HermesEnhancer] = None
 _pending_pre: Dict[str, float] = {}
@@ -94,5 +94,5 @@ def hooks() -> Dict[str, Callable]:
     enhancer = get_instance()
     return {
         "pre_tool_call": enhancer.pre_tool_call,
-        "post_tool_call": enhancer.post_tool_call,
+        "post_tool_call": enhancer.on_post_tool_call,
     }
