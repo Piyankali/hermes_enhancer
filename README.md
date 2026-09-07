@@ -4,7 +4,7 @@
 ![Hermes Agent](https://img.shields.io/badge/Hermes_Agent-v0.21.0-tested-green)
 ![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20Termux-orange)
 ![License](https://img.shields.io/badge/License-MIT-yellow)
-![Tests](https://img.shields.io/badge/tests-66_tracked_(58_core_%2B_8_installer)-brightgreen)
+![Tests](https://img.shields.io/badge/tests-67_tracked_(59_core_%2B_8_installer)-brightgreen)
 
 > **Self-healing telemetry middleware for Hermes Agent** — it records tool
 > executions, learns from outcomes, predicts likely next tools, and persists
@@ -793,10 +793,10 @@ pip install pytest pytest-asyncio   # test dependencies only
 python3 -m pytest tests -q
 ```
 
-66 tracked tests across 12 files: **58 core validation + 8 installer**
+67 tracked tests across 13 test files: **59 core validation + 8 installer**
 (the 8 installer tests execute the real scripts against fake
 `HERMES_HOME`s and take ~10 s; they were run separately at release, not
-in the same command as the 58).
+in the same command as the 59).
 
 | Suite | Tests | Proves |
 |---|---|---|
@@ -804,7 +804,7 @@ in the same command as the 58).
 | `test_v022_corruption.py` | 6 | health-check paths |
 | `test_v022_malformed_buffer.py` | 6 | quarantine without loss |
 | `test_v022_async.py` | 4 | async buffer integration |
-| `test_v022_async_hook_regression.py` | 3 | asyncio import + hook timing lock-in |
+| `test_v022_async_hook_regression.py` | 4 | asyncio import + timing/failure lock-in |
 | `test_v022_concurrent_timing.py` | 6 | same/different-tool overlap, failure path, fallback |
 | `test_v022_startup_recovery.py` | 5 | automatic bounded recovery |
 | `test_v022_crash_recovery.py` | 4 | `os._exit` crash durability |
@@ -813,7 +813,7 @@ in the same command as the 58).
 | `test_v022_storage_failure.py` | 3 | simulated ENOSPC + unwritable dir |
 | `test_v022_multiprocess.py` | 1 | 4 processes x 1500 writes |
 | `test_v022_installer.py` | 8 | setup/uninstall end-to-end (fake homes) |
-| **Total** | **66** | **58 core + 8 installer** |
+| **Total** | **67** | **59 core + 8 installer** |
 
 `tests/crash_child.py` is a crash/multiprocess child driver, not a test.
 Note: bare root `pytest` also collects `src/self_test.py`, which fails
@@ -989,10 +989,10 @@ hermes_enhancer/
 │   └── self_test.py
 ├── scripts/
 │   └── stats.py                 # repo-only telemetry inspector (not installed)
-├── tests/                       # 13 tracked files
+├── tests/                       # 14 tracked files (13 test files + driver)
 │   ├── crash_child.py           # crash/multiprocess child driver (not a test)
 │   ├── test_pipeline.py         # 9 core regression
-│   └── test_v022_*.py           # 12 suites, 57 tests
+│   └── test_v022_*.py           # 12 suites, 58 tests
 ├── benchmarks/                  # v0.20.7-era micro-benchmark suite
 │   ├── benchmark.py
 │   ├── README.md

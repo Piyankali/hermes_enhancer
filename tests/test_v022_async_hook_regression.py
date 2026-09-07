@@ -113,6 +113,46 @@ def test_maybe_schedule_io_running_loop_no_nameerror(mods, tmp_path):
         db.shutdown()
 
 
+def test_register_post_forwards_failure_status(mods, tmp_path):
+    """Register path must record failed tools as failed (status/error kept)."""
+    pkg = _load_plugin_package(mods)
+    pkg._instance = None
+    ctx = MagicMock()
+    ctx.node_id = "regression"
+    pkg.register(ctx)
+    enhancer = pkg._instance
+    enhancer.db.shutdown()
+    db = mods["federated_db"].FederatedDB(db_path=_make_tmp_db(tmp_path))
+    enhancer.db = db
+    try:
+        registered = {c.args[0]: c.args[1] for c in ctx.register_hook.call_args_list}
+        registered["pre_tool_call"](tool_name="brittle_tool", tool_call_id="fail-1")
+        time.sleep(0.02)
+        registered["post_tool_call"](
+            tool_name="brittle_tool",
+            tool_call_id="fail-1",
+            result="boom",
+            status="error",
+            error_type="RuntimeError",
+            error_message="boom",
+        )
+        db.flush()
+        rows = db.get_recent(5)
+        posts = [
+            r
+            for r in rows
+            if r.get("payload", {}).get("hook") == "post_tool_call"
+            and r.get("payload", {}).get("tool_call_id") == "fail-1"
+        ]
+        assert len(posts) == 1
+        payload = posts[0]["payload"]
+        assert payload.get("success") is False
+        assert payload.get("status") == "failed"
+        assert payload.get("error") == "boom"
+    finally:
+        db.shutdown()
+
+
 def test_register_hook_path_measures_real_interval(mods, tmp_path):
     """Regression B (lock-in): real register() pre/post measures the interval."""
     pkg = _load_plugin_package(mods)

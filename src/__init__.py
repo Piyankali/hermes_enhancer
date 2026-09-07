@@ -75,6 +75,9 @@ def register(ctx) -> None:
             pre_state=pre_state,
             result=result,
             error=RuntimeError(error_message) if error_message else None,
+            status=status,
+            error_type=error_type,
+            error_message=error_message,
             tool_call_id=tool_call_id,
         )
 
