@@ -10,7 +10,7 @@
 > executions, learns from outcomes, predicts likely next tools, and persists
 > telemetry through a crash-safe event buffer with automatic startup recovery.
 
-**Version:** `0.22.0`
+**Version:** `0.22.1`
 **Status:** Beta (process-crash/restart durability validated; power-loss
 durability is not claimed — see [Failure boundaries](#failure-boundaries))
 **Python:** 3.10+
@@ -86,8 +86,8 @@ workflows, not generic benchmarks.
 
 | Item | Value | Source |
 |---|---|---|
-| Plugin version | `0.22.0` | `plugin.yaml` |
-| Installer gate | `0.22.0` (`EXPECTED_VERSION`) | `setup.sh` |
+| Plugin version | `0.22.1` | `plugin.yaml` |
+| Installer gate | `0.22.1` (`EXPECTED_VERSION`) | `setup.sh` |
 | Status | Beta | this release |
 | Python | 3.10+ | `setup.sh` byte-compile / test runs |
 | Hermes | Tested against Hermes Agent **v0.21.0** CLI | `results/v0.22_installer_validation.md` |
@@ -623,7 +623,7 @@ Stage plugin files (exact runtime set, temp staging dir)
       ↓
 Install hermes_enhancer (atomic replace; old tree backed up, never merged)
       ↓
-Verify installation (files, version 0.22.0, byte-compile out of tree)
+Verify installation (files, version 0.22.1, byte-compile out of tree)
       ↓
 Verify Hermes plugin discovery (hermes plugins list)
       ↓
@@ -633,12 +633,12 @@ Plugin ready
 Step by step (verified against `setup.sh` source):
 
 1. **Project check** — all 11 required files must exist; `plugin.yaml`
-   must report `0.22.0` or the installer aborts.
+   must report `0.22.1` or the installer aborts.
 2. **Hermes home detection** — `$HERMES_HOME`, default `$HOME/.hermes`;
    plugin destination `$HERMES_HOME/plugins/hermes_enhancer`.
 3. **Staging** — the nine `src/*.py` modules plus `plugin.yaml` and
    `README.md` are copied to a temp staging dir (same filesystem for an
-   atomic move) and re-checked for version `0.22.0`. `scripts/stats.py`,
+   atomic move) and re-checked for version `0.22.1`. `scripts/stats.py`,
    tests, benchmarks, caches, and VCS metadata are never staged.
 4. **Atomic install** — an existing tree is moved to a timestamped backup
    (`.hermes_enhancer.bak.YYYYMMDD_HHMMSS`, never merged, never deleted),
@@ -694,13 +694,13 @@ backup directory printed during installation if needed.
 ```bash
 hermes plugins list --plain | grep hermes_enhancer
 hermes plugins show hermes_enhancer
-cat ~/.hermes/plugins/hermes_enhancer/plugin.yaml   # version: 0.22.0
+cat ~/.hermes/plugins/hermes_enhancer/plugin.yaml   # version: 0.22.1
 ls ~/.hermes/plugins/hermes_enhancer/                # 9 .py modules + plugin.yaml + README.md
 ```
 
 `setup.sh` already performs all of these checks and prints
 `Plugin installation: PASS` / `Plugin discovery: PASS` /
-`Plugin version: 0.22.0` — only those lines count as verified success.
+`Plugin version: 0.22.1` — only those lines count as verified success.
 
 ---
 
@@ -943,7 +943,7 @@ directory itself — not `src.*` submodules.
 
 **Version mismatch.** Compare `cat plugin.yaml` (repo) with
 `cat ~/.hermes/plugins/hermes_enhancer/plugin.yaml` (installed); both
-must read `0.22.0`. Re-run `bash setup.sh` to reconcile.
+must read `0.22.1`. Re-run `bash setup.sh` to reconcile.
 
 ---
 
@@ -969,7 +969,7 @@ Tracked files only (`git ls-files`):
 
 ```text
 hermes_enhancer/
-├── plugin.yaml                  # name, version 0.22.0, hooks
+├── plugin.yaml                  # name, version 0.22.1, hooks
 ├── README.md                    # this file
 ├── LICENSE
 ├── .gitignore

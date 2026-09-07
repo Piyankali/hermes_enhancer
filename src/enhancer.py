@@ -6,6 +6,7 @@ accounting, memory retention monitoring, and targeted cleanup hooks.
 
 from __future__ import annotations
 
+import asyncio
 import gc
 import logging
 import os
