@@ -4,7 +4,7 @@
 ![Hermes Agent](https://img.shields.io/badge/Hermes_Agent-v0.20.6%2B-green)
 ![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows%20%7C%20Termux-orange)
 ![License](https://img.shields.io/badge/License-MIT-yellow)
-![Tests](https://img.shields.io/badge/tests-16%20passed-brightgreen)
+![Tests](https://img.shields.io/badge/tests-49%20passed-brightgreen)
 
 > **Autonomous self-healing middleware for Hermes Agent** with microsecond-accurate telemetry, predictive preloading, meta-learning optimization, and federated analytics. Designed for cross-platform execution (Linux, macOS, Windows, Android/Termux).
 
@@ -17,6 +17,7 @@
 - [11 Core Systems Architecture Matrix](#11-core-systems-architecture-matrix)
 - [Project Tree Structure](#project-tree-structure)
 - [v0.20.7 Production Features](#v0207-production-features)
+- [v0.22 Durability Notes](#v022-durability-notes)
 - [Real-World Realized Benefits](#real-world-realized-benefits)
 - [Analytics & Observability](#analytics--observability)
 - [Design Philosophy](#design-philosophy)
@@ -38,10 +39,27 @@ Hermes Enhancer is an enterprise-grade plugin for the Hermes Agent that transfor
 
 Built for production environments, it combines telemetry-driven learning, predictive preloading, memory guards, and anomaly detection into a single, cohesive plugin that requires zero manual tuning after installation.
 
-**Current Version:** `0.20.7`  
-**Status:** Enterprise Production Ready  
+**Current Version:** `0.22.0`
+**Status:** Beta (process-crash/restart durability validated; see v0.22 notes below)
 **Python:** 3.10+  
 **License:** MIT
+
+---
+
+## v0.22 Durability Notes
+
+v0.22 adds a persistent crash-safe event buffer to the federated telemetry store (`src/federated_db.py`):
+
+- Buffer-before-persistence ordering: `enqueue_to_buffer()` commits first, final `sync_queue` insert second, `mark_buffer_persisted()` finalizes last. Finalization never precedes the final commit.
+- Idempotent `event_id` persistence: UNIQUE `event_id` in `event_buffer`, idempotent final inserts plus a partial unique index on `sync_queue(event_id)`. Retried pushes return the existing row id instead of duplicating.
+- Automatic startup recovery: every `FederatedDB` initialization runs bounded recovery (at most 100 rows per invocation); leftovers drain on later ticks/restarts. Observable via `get_startup_recovery_info()`.
+- Retry behavior: transient SQLite busy/locked errors are retried with backoff; permanent/unknown errors are counted (`permanent_errors`/`unknown_errors`) and surfaced, never retried forever. Buffer-write failures are fail-loud — never silently bypassed.
+- SQLite health validation: `verify_database()` reports `PRAGMA quick_check` / `integrity_check` without ever deleting or recreating data.
+- Malformed-buffer handling: corrupt payloads are marked FAILED with a diagnosis, preserved (never silently deleted); unknown-state rows are left in place; healthy rows keep flowing.
+- Graceful shutdown drains the worker queue; bounded in-memory queue (refusals return None and count as `events_dropped`).
+- Telemetry semantics: `events_enqueued` counts queue admissions (async path only); `events_persisted` counts final commits (sync + worker); all counters are process-local and reset on restart — SQLite state is the durable source of truth.
+- v0.21 APIs preserved unchanged: `push`, `get_recent`, `count`, `async_push`, `flush`.
+- Explicit non-guarantees: power-loss/OS-crash durability NOT validated (`synchronous=NORMAL`, no fsync); physical disk-full NOT directly tested (deterministic simulation only); no universal exactly-once claim — the tested guarantee is no duplicate persisted `event_id` and no loss of confirmed durable buffered events across tested process crash/restart scenarios.
 
 ---
 
@@ -306,10 +324,30 @@ git clone https://github.com/Piyankali/hermes_enhancer.git
 # Enter directory
 cd hermes_enhancer
 
-# Create plugin directory and install
-mkdir -p ~/.hermes/plugins/hermes_enhancer/
-cp -r * ~/.hermes/plugins/hermes_enhancer/
+# Automatic plugin installation (verified, idempotent)
+chmod +x setup.sh
+./setup.sh
 ```
+
+`setup.sh` installs Hermes Enhancer v0.22.0 into the Hermes user plugin
+directory (`~/.hermes/plugins/hermes_enhancer`, or `$HERMES_HOME` when set)
+and verifies the result. It checks `plugin.yaml` reports version `0.22.0`,
+stages exactly the runtime file set (the nine `src/*.py` modules,
+`plugin.yaml`, `README.md` — no `.git`, caches, tests, or temp files),
+replaces any previous install atomically (the old tree is kept as a
+timestamped backup, never merged), byte-compiles the installed modules,
+and confirms discovery via `hermes plugins list`.
+
+- Repeated execution is safe: re-running `./setup.sh` updates in place
+  with a fresh backup and reports "updating safely".
+- To remove only this plugin: `chmod +x uninstall.sh && ./uninstall.sh`
+  (idempotent; other plugins, user data, and `~/.hermes/state.db` are
+  never touched).
+- Supported and tested here: Termux/Android and Linux shells with
+  standard `bash`, `coreutils`, and `python3`. No root, no network,
+  no `sudo`, no shell-startup edits.
+- The installer does NOT modify `~/.hermes/state.db`, run
+  `hermes doctor --fix`, or edit `~/.hermes/config.yaml`.
 
 ### Enable Plugin
 

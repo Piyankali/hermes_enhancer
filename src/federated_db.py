@@ -160,6 +160,24 @@ class FederatedDB:
                     persisted INTEGER DEFAULT 1,
                     retry_count INTEGER DEFAULT 0
                 );
+                CREATE TABLE IF NOT EXISTS event_buffer (
+                    event_id TEXT UNIQUE NOT NULL PRIMARY KEY,
+                    trace_id TEXT NOT NULL,
+                    tool_call_id TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    state TEXT NOT NULL DEFAULT 'CREATED',
+                    attempt_count INTEGER NOT NULL DEFAULT 0,
+                    last_error TEXT,
+                    next_retry_at TEXT,
+                    buffered_at TEXT NOT NULL,
+                    persisted_at TEXT,
+                    schema_version INTEGER NOT NULL DEFAULT 1,
+                    checksum TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_event_buffer_event_id
+                    ON event_buffer(event_id);
                 CREATE TABLE IF NOT EXISTS summary_analytics (
                     tool TEXT,
                     day TEXT NOT NULL,
@@ -197,6 +215,8 @@ class FederatedDB:
                     ON sync_queue(tool);
                 CREATE INDEX IF NOT EXISTS idx_sync_queue_event_id
                     ON sync_queue(event_id);
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_sync_queue_event_id_unique
+                    ON sync_queue(event_id) WHERE event_id != '';
                 CREATE INDEX IF NOT EXISTS idx_sync_queue_trace_id
                     ON sync_queue(trace_id);
             """
@@ -205,6 +225,320 @@ class FederatedDB:
         finally:
             conn.close()
         self._integrity_check()
+        self._startup_recovery()
+
+    # ------------------------------------------------------------------ #
+    # v0.22 buffer management
+    # ------------------------------------------------------------------ #
+    def enqueue_to_buffer(self, event_id, trace_id, tool_call_id, event_type, payload):
+        import json as _json
+        if isinstance(payload, dict):
+            payload = _json.dumps(payload)
+        conn = self._get_conn()
+        try:
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO event_buffer"
+                " (event_id, trace_id, tool_call_id, event_type, payload,"
+                " created_at, state, attempt_count, last_error, next_retry_at,"
+                " buffered_at, persisted_at, schema_version, checksum)"
+                " VALUES (?, ?, ?, ?, ?, datetime('now'), 'CREATED', 0, NULL, NULL,"
+                " datetime('now'), NULL, 1, NULL)",
+                (event_id, trace_id, tool_call_id, event_type, payload),
+            )
+            if cur.rowcount > 0:
+                conn.commit()
+                return True
+            return False
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    def mark_buffer_persisted(self, event_id):
+        conn = self._get_conn()
+        try:
+            cur = conn.execute(
+                "UPDATE event_buffer SET state='PERSISTED',"
+                " persisted_at=datetime('now')"
+                " WHERE event_id=? AND state!='PERSISTED'",
+                (event_id,),
+            )
+            if cur.rowcount > 0:
+                conn.commit()
+                return True
+            return False
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    def get_buffer_event(self, event_id):
+        conn = self._get_conn()
+        try:
+            cur = conn.execute(
+                "SELECT event_id, trace_id, tool_call_id, event_type, payload,"
+                " created_at, state, attempt_count, last_error, next_retry_at,"
+                " buffered_at, persisted_at, schema_version, checksum"
+                " FROM event_buffer WHERE event_id=?",
+                (event_id,),
+            )
+            row = cur.fetchone()
+            if row is None:
+                return None
+            return {
+                "event_id": row[0],
+                "trace_id": row[1],
+                "tool_call_id": row[2],
+                "event_type": row[3],
+                "payload": row[4],
+                "created_at": row[5],
+                "state": row[6],
+                "attempt_count": row[7],
+                "last_error": row[8],
+                "next_retry_at": row[9],
+                "buffered_at": row[10],
+                "persisted_at": row[11],
+                "schema_version": row[12],
+                "checksum": row[13],
+            }
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    def get_buffer_summary(self):
+        conn = self._get_conn()
+        try:
+            cur = conn.execute(
+                "SELECT state, COUNT(*) FROM event_buffer GROUP BY state"
+            )
+            by_state = {r[0]: r[1] for r in cur.fetchall()}
+            total = sum(by_state.values())
+            summary = {"total": total}
+            summary.update(by_state)
+            return summary
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    def get_event(self, event_id):
+        conn = self._get_conn()
+        try:
+            cur = conn.execute(
+                "SELECT id, payload, timestamp, node_id, event_id,"
+                " trace_id, tool_call_id FROM sync_queue WHERE event_id=?",
+                (event_id,),
+            )
+            row = cur.fetchone()
+            if row is None:
+                return None
+            return {
+                "id": row[0],
+                "payload": row[1],
+                "timestamp": row[2],
+                "node_id": row[3],
+                "event_id": row[4],
+                "trace_id": row[5],
+                "tool_call_id": row[6],
+            }
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    def recover_buffered_events(self):
+        conn = self._get_conn()
+        try:
+            # Bounded: at most 100 rows per invocation. Rows finalized
+            # during this call are excluded by the WHERE filter, so each
+            # call re-reads from the head; leftover backlog is picked up
+            # by the next scheduler tick or process startup.
+            batch_size = 100
+            recovered = 0
+            skipped = 0
+            states_seen = set()
+            cur = conn.execute(
+                "SELECT event_id, trace_id, tool_call_id, event_type, payload,"
+                " created_at, state, attempt_count, last_error, next_retry_at,"
+                " buffered_at, persisted_at, schema_version, checksum"
+                " FROM event_buffer"
+                " WHERE state IN"
+                " ('CREATED','BUFFERED','QUEUED','PERSISTING','FAILED','RETRY_WAIT')"
+                " ORDER BY created_at LIMIT ?",
+                (batch_size,),
+            )
+            rows = cur.fetchall()
+            for row in rows:
+                eid = row[0]
+                states_seen.add(row[6])
+                try:
+                    json.loads(row[4])
+                except Exception as exc:
+                    try:
+                        conn.execute(
+                            "UPDATE event_buffer SET state='FAILED',"
+                            " last_error=?,"
+                            " attempt_count=attempt_count+1"
+                            " WHERE event_id=?",
+                            ("corrupt_payload: %s" % exc, eid),
+                        )
+                        conn.commit()
+                    except Exception:
+                        pass
+                    continue
+                try:
+                    exists = self.get_event(eid)
+                except Exception:
+                    exists = None
+                if exists is not None:
+                    try:
+                        self.mark_buffer_persisted(eid)
+                    except Exception:
+                        pass
+                    skipped += 1
+                else:
+                    try:
+                        conn.execute(
+                            "INSERT OR IGNORE INTO sync_queue"
+                            " (payload, timestamp, node_id, event_id,"
+                            " trace_id, tool_call_id, persisted)"
+                            " VALUES (?, datetime('now'), 'local', ?, ?, ?, 1)",
+                            (row[4], eid, row[1], row[2]),
+                        )
+                        conn.commit()
+                        try:
+                            self.mark_buffer_persisted(eid)
+                        except Exception:
+                            pass
+                        recovered += 1
+                    except Exception:
+                        try:
+                            conn.execute(
+                                "UPDATE event_buffer SET state='FAILED',"
+                                " last_error='recovery_persistence_failed',"
+                                " attempt_count=attempt_count+1"
+                                " WHERE event_id=?",
+                                (eid,),
+                            )
+                            conn.commit()
+                        except Exception:
+                            pass
+            return {
+                "recovered": recovered,
+                "skipped": skipped,
+                "states_seen": sorted(states_seen),
+            }
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    def verify_database(self):
+        import sqlite3 as _sqlite3
+        try:
+            conn = self._get_conn()
+        except Exception as exc:
+            return {
+                "healthy": False,
+                "quick_check": "CONNECT_ERROR (%s)" % exc,
+                "integrity_check": "skipped",
+                "error": "Database inaccessible: %s" % exc,
+                "database": self.db_path,
+            }
+        try:
+            try:
+                quick = conn.execute("PRAGMA quick_check").fetchone()[0]
+            except _sqlite3.DatabaseError as exc:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                return {
+                    "healthy": False,
+                    "quick_check": "FAIL (%s)" % exc,
+                    "integrity_check": "skipped",
+                    "error": "Database corruption detected: %s" % exc,
+                    "database": self.db_path,
+                }
+            quick_result = "PASS" if quick == "ok" else "FAIL (%s)" % quick
+            try:
+                integ = conn.execute("PRAGMA integrity_check").fetchone()[0]
+                integ_result = "PASS" if integ == "ok" else "FAIL (%s)" % integ
+            except Exception as exc:
+                integ_result = "ERROR (%s)" % exc
+            healthy = quick_result == "PASS" and integ_result == "PASS"
+            try:
+                conn.close()
+            except Exception:
+                pass
+            return {
+                "healthy": healthy,
+                "quick_check": quick_result,
+                "integrity_check": integ_result,
+                "error": None if healthy else (
+                    "Database health check failed: quick=%s, integrity=%s"
+                    % (quick_result, integ_result)
+                ),
+                "database": self.db_path,
+            }
+        except _sqlite3.OperationalError as exc:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            return {
+                "healthy": False,
+                "quick_check": "OPERATIONAL_ERROR (%s)" % exc,
+                "integrity_check": "skipped",
+                "error": "Database inaccessible: %s" % exc,
+                "database": self.db_path,
+            }
+        except Exception as exc:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            return {
+                "healthy": False,
+                "quick_check": "ERROR (%s)" % exc,
+                "integrity_check": "skipped",
+                "error": "Unexpected health check error: %s" % exc,
+                "database": self.db_path,
+            }
+
+    def _startup_recovery(self):
+        try:
+            result = self.recover_buffered_events()
+        except Exception as exc:
+            try:
+                logger.warning("startup recovery failed: %s", exc)
+            except Exception:
+                pass
+            self._startup_recovery_info = {
+                "executed": True,
+                "recovered": 0,
+                "error": str(exc),
+            }
+            return self._startup_recovery_info
+        if isinstance(result, dict):
+            recovered = int(result.get("recovered", 0)) + int(
+                result.get("skipped", 0)
+            )
+        else:
+            recovered = int(result)
+        info = {"executed": True, "recovered": recovered, "error": None}
+        self._startup_recovery_info = info
+        return info
+
+    def get_startup_recovery_info(self):
+        return getattr(self, "_startup_recovery_info", {"executed": False})
 
     # ------------------------------------------------------------------ #
     # Retry logic
@@ -252,8 +586,11 @@ class FederatedDB:
         persisted=1,
         retry_count=0,
     ):
-        return conn.execute(
-            "INSERT INTO sync_queue "
+        # Idempotent final persistence: the partial unique index on
+        # sync_queue(event_id) turns a retried insert of the same event_id
+        # into a no-op; the existing row id is returned instead.
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO sync_queue "
             "(payload, timestamp, node_id, tool, anomalous, event_id, trace_id, tool_call_id, persisted, retry_count) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
@@ -268,7 +605,16 @@ class FederatedDB:
                 persisted,
                 retry_count,
             ),
-        ).lastrowid
+        )
+        if cur.lastrowid:
+            return cur.lastrowid
+        if event_id:
+            row = conn.execute(
+                "SELECT id FROM sync_queue WHERE event_id=?", (event_id,)
+            ).fetchone()
+            if row is not None:
+                return row[0]
+        return 0
 
     # ------------------------------------------------------------------ #
     # Public sync API (backward compatible)
@@ -282,6 +628,17 @@ class FederatedDB:
                 now = datetime.now(timezone.utc).isoformat()
                 tool = payload.get("tool") or payload.get("tool_name") or "unknown"
                 anomalous = 1 if payload.get("anomalous") else 0
+                event_id = payload.get("event_id") or uuid.uuid4().hex
+                trace_id = payload.get("trace_id") or uuid.uuid4().hex
+                tool_call_id = payload.get("tool_call_id") or ""
+                # Crash-safe ordering: the buffer commit must succeed before
+                # the event is considered queued. A buffer-write failure is
+                # fail-loud (propagates) so durability is never falsely
+                # reported; INSERT OR IGNORE means duplicates return False,
+                # never raise.
+                self.enqueue_to_buffer(
+                    event_id, trace_id, tool_call_id, "sync_push", payload
+                )
                 row_id = self._with_retry(
                     self._insert_sync,
                     conn,
@@ -290,8 +647,17 @@ class FederatedDB:
                     node_id,
                     tool,
                     anomalous,
+                    event_id,
+                    trace_id,
+                    tool_call_id,
                 )
                 conn.commit()
+                with self._counters_lock:
+                    self._counters["events_persisted"] += 1
+                try:
+                    self.mark_buffer_persisted(event_id)
+                except Exception:
+                    pass
                 self._maybe_prune(conn)
                 return row_id
             finally:
@@ -380,6 +746,12 @@ class FederatedDB:
                     self._counters["events_persisted"] += len(buffer)
                 for event in buffer:
                     event["status"] = "persisted"
+                    try:
+                        eid = event.get("event_id", "")
+                        if eid:
+                            self.mark_buffer_persisted(eid)
+                    except Exception:
+                        pass
                 self._maybe_prune(conn)
                 return
             except sqlite3.OperationalError as exc:
@@ -618,9 +990,25 @@ class FederatedDB:
     # ------------------------------------------------------------------ #
     # Async wrappers
     # ------------------------------------------------------------------ #
+    def _enqueue_durable(self, payload: dict, node_id: str = "local"):
+        event_id = payload.get("event_id") or self._generate_event_id()
+        trace_id = payload.get("trace_id") or self._generate_trace_id()
+        tool_call_id = payload.get("tool_call_id") or ""
+        # Same fail-loud rule as push(): no silent buffering bypass.
+        self.enqueue_to_buffer(
+            event_id, trace_id, tool_call_id, "async_push", payload
+        )
+        return self.enqueue_event(
+            payload,
+            node_id,
+            event_id=event_id,
+            trace_id=trace_id,
+            tool_call_id=tool_call_id,
+        )
+
     async def async_push(self, payload: dict, node_id: str = "local") -> Optional[str]:
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(_EXECUTOR, self.enqueue_event, payload, node_id)
+        return await loop.run_in_executor(_EXECUTOR, self._enqueue_durable, payload, node_id)
 
     async def async_get_recent(self, limit: int = 100) -> list[dict[str, Any]]:
         loop = asyncio.get_running_loop()
