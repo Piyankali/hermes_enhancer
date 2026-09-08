@@ -44,29 +44,56 @@ _FLAT_MODULES = [
 ]
 
 
+_PKG = "hermes_plugins.hermes_enhancer_test"
+
+
+def _evict_test_modules():
+    for key in [k for k in sys.modules if k == _PKG or k.startswith(_PKG + ".")]:
+        del sys.modules[key]
+    sys.modules.pop("hermes_plugins", None)
+    sys.modules.pop("hermes_enhancer_test_pkg", None)
+
+
 def _load_flat_modules():
-    """Load src/*.py as top-level modules (installed flat-plugin layout)."""
+    """Load src/*.py as a package, mirroring the real Hermes plugin loader.
+
+    Hermes loads a directory plugin as ``hermes_plugins.<slug>`` via
+    spec_from_file_location with submodule_search_locations, so sibling
+    modules use package-relative imports. The previous flat top-level
+    loader encoded the pre-fix absolute-import assumption that broke
+    gateway loading (No module named 'enhancer').
+    """
+    _evict_test_modules()
+    ns = types.ModuleType("hermes_plugins")
+    ns.__path__ = []
+    ns.__package__ = "hermes_plugins"
+    sys.modules["hermes_plugins"] = ns
+    pkg = types.ModuleType(_PKG)
+    pkg.__path__ = [str(SRC_DIR)]
+    pkg.__package__ = _PKG
+    sys.modules[_PKG] = pkg
     loaded = {}
     for name in _FLAT_MODULES:
-        sys.modules.pop(name, None)
-    for name in _FLAT_MODULES:
-        spec = importlib.util.spec_from_file_location(name, SRC_DIR / f"{name}.py")
+        spec = importlib.util.spec_from_file_location(
+            f"{_PKG}.{name}", SRC_DIR / f"{name}.py"
+        )
         mod = importlib.util.module_from_spec(spec)
-        sys.modules[name] = mod
+        mod.__package__ = _PKG
+        sys.modules[f"{_PKG}.{name}"] = mod
         spec.loader.exec_module(mod)
         loaded[name] = mod
     return loaded
 
 
 def _load_plugin_package(mods):
-    """Load src/__init__.py against the already-loaded flat modules."""
-    pkg = types.ModuleType("hermes_enhancer_test_pkg")
-    pkg.__path__ = [str(SRC_DIR)]
+    """Load src/__init__.py as the test package, mirroring the Hermes loader."""
     spec = importlib.util.spec_from_file_location(
-        "hermes_enhancer_test_pkg", SRC_DIR / "__init__.py"
+        _PKG, SRC_DIR / "__init__.py", submodule_search_locations=[str(SRC_DIR)]
     )
     mod = importlib.util.module_from_spec(spec)
-    sys.modules["hermes_enhancer_test_pkg"] = mod
+    mod.__package__ = _PKG
+    mod.__path__ = [str(SRC_DIR)]
+    sys.modules[_PKG] = mod
     spec.loader.exec_module(mod)
     return mod
 
@@ -75,9 +102,7 @@ def _load_plugin_package(mods):
 def mods():
     loaded = _load_flat_modules()
     yield loaded
-    for name in _FLAT_MODULES:
-        sys.modules.pop(name, None)
-    sys.modules.pop("hermes_enhancer_test_pkg", None)
+    _evict_test_modules()
 
 
 def _make_tmp_db(tmp_path):
