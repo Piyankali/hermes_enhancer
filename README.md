@@ -4,17 +4,67 @@
 ![Hermes Agent](https://img.shields.io/badge/Hermes_Agent-v0.21.0-tested-green)
 ![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20Termux-orange)
 ![License](https://img.shields.io/badge/License-MIT-yellow)
-![Tests](https://img.shields.io/badge/tests-67_tracked_(59_core_%2B_8_installer)-brightgreen)
+![Tests](https://img.shields.io/badge/tests-152_(77_v022_%2B_75_v023)-brightgreen)
 
 > **Self-healing telemetry middleware for Hermes Agent** — it records tool
 > executions, learns from outcomes, predicts likely next tools, and persists
 > telemetry through a crash-safe event buffer with automatic startup recovery.
 
-**Version:** `0.22.2`
+**Version:** `0.23.0`
 **Status:** Beta (process-crash/restart durability validated; power-loss
 durability is not claimed — see [Failure boundaries](#failure-boundaries))
 **Python:** 3.10+
 **License:** MIT
+
+## v0.23.0 — what actually works
+
+v0.23 closes the loops v0.22 left open. Every item below is implemented,
+tested, and wired into the runtime hook path:
+
+- Telemetry redaction (`src/redaction.py`): recursive, case-insensitive
+  sanitizer over 20+ secret tokens. Applied at every DB entry point
+  (`enqueue_event`, `push`, `_enqueue_durable`, `enqueue_to_buffer`) plus
+  learning ingest, so plaintext secrets never reach SQLite. Default
+  replacement is the literal `[REDACTED]` (no hashing).
+- Persistent learning: EMA scores (`tool_feedback`), Markov transitions
+  (`tool_transitions`), per-tool latency/failure stats
+  (`meta_tool_stats`), successful pair sequences (`meta_sequences`) all
+  survive restart via schema v2 + migrations. Learners load on init and
+  persist every 20 post-hooks (background) plus on explicit flush.
+- Feedback drives decisions: `rank_candidates()` with sample-based
+  confidence is consumed by `src/decision_engine.py`, which fuses
+  feedback + prediction + meta + graph signals into ranked, gated
+  suggestions. Policies: observe (default, ranking only) → recommend →
+  approved → automatic. Low confidence yields no optimization, never an
+  unsafe guess; the only available tool is never removed; privileged
+  tools need very high confidence.
+- Predictions are real objects: `plan_next()` returns bounded plans with
+  TTL/invalidation/consumption, logged to the `predictions` table
+  (throttled) and consumed by the decision engine. Planning executes
+  nothing.
+- Meta-learner derives per-tool fail rates, latency averages, and
+  success-rate-ranked follow-up recommendations (`learn`/`recommend`/
+  `rank_workflows`/`failure_patterns`). Statistical heuristics only —
+  no neural/RL/LLM/embedding claims.
+- Skill graph is runtime-usable: validated registration, `detect_cycles()`,
+  `topological_order()` raising `CycleError` (no infinite recursion),
+  DB hydration quarantines invalid rows (never executed).
+- Composer is a safe workflow engine: trusted in-process handler registry
+  (names only, never callables from storage), static plan validation,
+  bounded steps/retries/timeouts, fail-fast, cancellation, audit trail.
+  No eval/exec/pickle anywhere in `src/`.
+- Startup health: lightweight `startup_check()` on register
+  (config/DB/schema/queue/redaction/graph/learners → PASS/WARN/FAIL),
+  full `run_full_diagnostics()` on demand. Only genuinely safe repairs
+  run automatically (cache bounds, queue/transition pruning, buffer
+  recovery, orphan marking); each is logged.
+- Orphans: `find_orphans()`/`mark_orphans()` distinguish
+  completed/failed/orphaned/unknown without inventing durations.
+
+What is still recommendation-only: the decision engine never overrides
+Hermes tools by itself (observe by default); the composer executes only
+explicitly built plans through registered handlers. Privileged or
+destructive operations are never autonomously generated from learned data.
 
 ---
 
@@ -86,8 +136,8 @@ workflows, not generic benchmarks.
 
 | Item | Value | Source |
 |---|---|---|
-| Plugin version | `0.22.2` | `plugin.yaml` |
-| Installer gate | `0.22.2` (`EXPECTED_VERSION`) | `setup.sh` |
+| Plugin version | `0.23.0` | `plugin.yaml` |
+| Installer gate | `0.23.0` (`EXPECTED_VERSION`) | `setup.sh` |
 | Status | Beta | this release |
 | Python | 3.10+ | `setup.sh` byte-compile / test runs |
 | Hermes | Tested against Hermes Agent **v0.21.0** CLI | `results/v0.22_installer_validation.md` |
@@ -623,7 +673,7 @@ Stage plugin files (exact runtime set, temp staging dir)
       ↓
 Install hermes_enhancer (atomic replace; old tree backed up, never merged)
       ↓
-Verify installation (files, version 0.22.2, byte-compile out of tree)
+Verify installation (files, version 0.23.0, byte-compile out of tree)
       ↓
 Verify Hermes plugin discovery (hermes plugins list)
       ↓
@@ -633,7 +683,7 @@ Plugin ready
 Step by step (verified against `setup.sh` source):
 
 1. **Project check** — all 11 required files must exist; `plugin.yaml`
-   must report `0.22.2` or the installer aborts.
+   must report `0.23.0` or the installer aborts.
 2. **Hermes home detection** — `$HERMES_HOME`, default `$HOME/.hermes`;
    plugin destination `$HERMES_HOME/plugins/hermes_enhancer`.
 3. **Staging** — the nine `src/*.py` modules plus `plugin.yaml` and

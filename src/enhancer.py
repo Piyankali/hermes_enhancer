@@ -16,13 +16,26 @@ import tracemalloc
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from .federated_db import get_db, FederatedDB
-from .self_test import SelfTestEngine
-from .feedback_optimizer import FeedbackOptimizer
-from .predictive_preload import PredictivePreload
-from .meta_learner import MetaLearner
-from .skill_graph import SkillGraph
-from .composer import SkillComposer
+try:  # Package import (Hermes plugin loader: hermes_plugins.<slug>).
+    from .federated_db import get_db, FederatedDB
+    from .self_test import SelfTestEngine
+    from .feedback_optimizer import FeedbackOptimizer
+    from .predictive_preload import PredictivePreload
+    from .meta_learner import MetaLearner
+    from .skill_graph import SkillGraph
+    from .composer import SkillComposer
+    from .decision_engine import DecisionEngine
+    from .redaction import sanitize
+except ImportError:  # Top-level import (tests / standalone use with src on path).
+    from federated_db import get_db, FederatedDB
+    from self_test import SelfTestEngine
+    from feedback_optimizer import FeedbackOptimizer
+    from predictive_preload import PredictivePreload
+    from meta_learner import MetaLearner
+    from skill_graph import SkillGraph
+    from composer import SkillComposer
+    from decision_engine import DecisionEngine
+    from redaction import sanitize
 
 logger = logging.getLogger("hermes.enhancer")
 if not logger.handlers:
@@ -32,6 +45,10 @@ if not logger.handlers:
     logger.setLevel(logging.INFO)
 
 _IO_EXECUTOR = ThreadPoolExecutor(max_workers=2)
+
+# Persist learner state every N post-hook events (amortized I/O) and on
+# explicit flush. A missed window only delays durability; events are safe.
+LEARNER_PERSIST_EVERY = 20
 
 
 class HermesEnhancer:
@@ -46,8 +63,13 @@ class HermesEnhancer:
         self.meta_learner = MetaLearner()
         self.skill_graph = SkillGraph()
         self.composer = SkillComposer()
+        self.decision = DecisionEngine(
+            feedback=self.feedback, preload=self.preload,
+            meta_learner=self.meta_learner, skill_graph=self.skill_graph)
         self._enabled = True
         self._start_times: Dict[str, float] = {}
+        self._post_count = 0
+        self._pred_log_at: Dict[Tuple[str, str], float] = {}
 
         self._trace_id: Optional[str] = None
         self._tool_call_id: Optional[str] = None
@@ -55,6 +77,143 @@ class HermesEnhancer:
         tracemalloc.start()
         self._baseline_snapshot = tracemalloc.take_snapshot()
         self._last_memory_snapshot_bytes = 0
+        self._learners_loaded = self._load_learners()
+
+    # ------------------------------------------------------------------ #
+    # Persistent learners
+    # ------------------------------------------------------------------ #
+    def _load_learners(self) -> Dict[str, Any]:
+        """Restore learner state from SQLite. Best-effort, never raises."""
+        loaded: Dict[str, Any] = {"feedback": 0, "transitions": 0,
+                                  "stats": 0, "sequences": 0, "errors": []}
+        try:
+            loaded["feedback"] = self.feedback.load_from_db(self.db)
+        except Exception as exc:
+            loaded["errors"].append("feedback: %s" % exc)
+        try:
+            loaded["transitions"] = self.preload.load_from_db(self.db)
+        except Exception as exc:
+            loaded["errors"].append("transitions: %s" % exc)
+        try:
+            stats = self.meta_learner.load_from_db(self.db)
+            loaded["stats"] = stats["stats"]
+            loaded["sequences"] = stats["sequences"]
+        except Exception as exc:
+            loaded["errors"].append("meta: %s" % exc)
+        if loaded["errors"]:
+            logger.warning("Learner restore partial: %s", loaded["errors"])
+        return loaded
+
+    def persist_learners(self) -> Dict[str, Any]:
+        """Flush learner state to SQLite. Best-effort, never raises."""
+        report: Dict[str, Any] = {"feedback": 0, "transitions": 0,
+                                  "stats": 0, "sequences": 0, "errors": []}
+        try:
+            saved = self.db.persist_learner_state(
+                self.feedback.to_rows(), self.preload.to_rows(),
+                self.meta_learner.to_stat_rows(),
+                self.meta_learner.to_sequence_rows())
+            report.update(saved)
+            try:
+                self.db.prune_transitions()
+            except Exception:
+                pass
+        except Exception as exc:
+            report["errors"].append("persist: %s" % exc)
+        if report["errors"]:
+            logger.warning("Learner persist partial: %s", report["errors"])
+        return report
+
+    def startup_check(self) -> Dict[str, Any]:
+        """Lightweight, non-blocking health check for plugin init.
+
+        Covers config/DB/schema/migrations/queue/learners/redaction/graph.
+        Returns {status: PASS|WARN|FAIL, checks: {...}}. Never raises,
+        never repairs, never blocks on I/O beyond fast local queries.
+        """
+        checks: Dict[str, Dict[str, Any]] = {}
+
+        def _record(name: str, ok: bool, detail: str = "",
+                    warn: bool = False) -> None:
+            checks[name] = {"status": "PASS" if ok else ("WARN" if warn else "FAIL"),
+                            "detail": detail}
+
+        _record("config", bool(self.node_id), "node_id=%s" % self.node_id)
+        try:
+            exists = os.path.exists(self.db.db_path)
+            _record("db_available", exists, self.db.db_path)
+        except Exception as exc:
+            _record("db_available", False, str(exc))
+        try:
+            version = self.db.get_schema_version()
+            _record("schema_version", version == str(2) or version == "2",
+                    "schema=%s" % version, warn=True)
+        except Exception as exc:
+            _record("schema_version", False, str(exc))
+        try:
+            summary = self.db.get_buffer_summary()
+            _record("event_buffer", True, "buffered=%s" % summary.get("total", 0))
+        except Exception as exc:
+            _record("event_buffer", False, str(exc))
+        try:
+            qsize = self.db._queue.qsize()
+            _record("queue", qsize < self.db._max_queue,
+                    "qsize=%d/%d" % (qsize, self.db._max_queue),
+                    warn=qsize >= self.db._max_queue)
+        except Exception as exc:
+            _record("queue", False, str(exc))
+        try:
+            try:
+                from .redaction import sanitize as _san
+            except ImportError:
+                from redaction import sanitize as _san  # type: ignore[no-redef]
+            probe = _san({"password": "x", "ok": 1})
+            _record("redaction",
+                    probe.get("password") == "[REDACTED]" and probe.get("ok") == 1,
+                    "smoke")
+        except Exception as exc:
+            _record("redaction", False, str(exc))
+        try:
+            graph_report = self.skill_graph.validate()
+            _record("skill_graph", graph_report["status"] == "PASS",
+                    "skills=%d cycles=%d" % (
+                        graph_report["skills"], len(graph_report["cycles"])),
+                    warn=bool(graph_report["cycles"]))
+        except Exception as exc:
+            _record("skill_graph", False, str(exc))
+        loaded = self._learners_loaded or {}
+        _record("learners", not loaded.get("errors"),
+                "restored=%s" % {k: v for k, v in loaded.items()
+                                 if k != "errors"},
+                warn=bool(loaded.get("errors")))
+        statuses = [c["status"] for c in checks.values()]
+        overall = "PASS"
+        if "FAIL" in statuses:
+            overall = "FAIL"
+        elif "WARN" in statuses:
+            overall = "WARN"
+        return {"status": overall, "checks": checks}
+
+    def run_full_diagnostics(self) -> Dict[str, Any]:
+        """On-demand deep diagnostic: startup check + integrity + orphans."""
+        report = self.startup_check()
+        try:
+            report["db_integrity"] = self.db.verify_database()
+        except Exception as exc:
+            report["db_integrity"] = {"healthy": False, "error": str(exc)}
+        try:
+            report["orphans"] = self.db.find_orphans(limit=50)
+        except Exception as exc:
+            report["orphans_error"] = str(exc)
+        try:
+            report["learning"] = {
+                "feedback": self.feedback.summary(),
+                "meta": self.meta_learner.summary(),
+                "predictions": len(self.preload.active_plans()),
+            }
+        except Exception as exc:
+            report["learning_error"] = str(exc)
+        return report
 
     # ------------------------------------------------------------------ #
     # Helpers
@@ -365,17 +524,56 @@ class HermesEnhancer:
         )
         self.preload.record(tool_name)
         self.preload.maybe_cleanup()
+        # Plans are observable, persisted (predictions table), and consumed
+        # by the decision engine. Planning never executes anything.
+        # Prediction LOGGING is throttled (same pair, 60 s) so the hot
+        # hook path stays lightweight; plans themselves are built always.
+        try:
+            plans = self.preload.plan_next(tool_name)
+            if plans:
+                now = time.time()
+                for p in plans:
+                    log_key = (tool_name, p["predicted_tool"])
+                    last = self._pred_log_at.get(log_key, 0.0)
+                    if now - last >= 60.0:
+                        try:
+                            self.db.log_prediction(
+                                tool_name, p["predicted_tool"], p["confidence"])
+                            self._pred_log_at[log_key] = now
+                        except Exception:
+                            pass
+                self.decision.recommend([p["predicted_tool"] for p in plans],
+                                        context_tool=tool_name)
+        except Exception as exc:
+            logger.debug("Preload planning failed: %s", exc)
         self.meta_learner.ingest({
             "tool": tool_name,
             "success": is_success,
             "delta_us": delta_us,
             "anomalous": 1 if anomalous else 0,
         })
+        # Amortized learner durability: persist every N post hooks in the
+        # background so fsync latency never blocks tool execution.
+        # Telemetry itself is already queued above; this only affects how
+        # quickly learned state becomes restart-safe. Explicit
+        # persist_learners() stays synchronous for shutdown/flush paths.
+        self._post_count += 1
+        if self._post_count % LEARNER_PERSIST_EVERY == 0:
+            try:
+                _IO_EXECUTOR.submit(self._persist_learners_guarded)
+            except Exception as exc:
+                logger.debug("Periodic learner persist submit failed: %s", exc)
 
         logger.debug(
             "Post tool hook: %s success=%s dt=%dms anomalous=%s trace=%s event=%s",
             tool_name, is_success, duration_ms, anomalous, trace_id, event_id,
         )
+
+    def _persist_learners_guarded(self) -> None:
+        try:
+            self.persist_learners()
+        except Exception as exc:
+            logger.debug("Periodic learner persist failed: %s", exc)
 
     def run_self_test(self) -> Dict[str, Any]:
         battery = self.self_test.run_battery()

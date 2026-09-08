@@ -20,7 +20,13 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
 
+try:
+    from .redaction import sanitize
+except ImportError:
+    from redaction import sanitize
+
 DB_PATH = os.path.expanduser("~/.hermes/federated.db")
+SCHEMA_VERSION = 2
 DEFAULT_PRUNE_THRESHOLD = 5000
 DEFAULT_RETENTION_DAYS = 14
 
@@ -203,10 +209,65 @@ class FederatedDB:
                     score REAL NOT NULL,
                     recorded_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS schema_meta (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS tool_feedback (
+                    tool TEXT PRIMARY KEY,
+                    score REAL NOT NULL DEFAULT 0.5,
+                    samples INTEGER NOT NULL DEFAULT 0,
+                    successes INTEGER NOT NULL DEFAULT 0,
+                    failures INTEGER NOT NULL DEFAULT 0,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS tool_transitions (
+                    prev_key TEXT NOT NULL,
+                    next_tool TEXT NOT NULL,
+                    count INTEGER NOT NULL DEFAULT 0,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (prev_key, next_tool)
+                );
+                CREATE TABLE IF NOT EXISTS meta_tool_stats (
+                    tool TEXT PRIMARY KEY,
+                    calls INTEGER NOT NULL DEFAULT 0,
+                    fails INTEGER NOT NULL DEFAULT 0,
+                    total_duration_us INTEGER NOT NULL DEFAULT 0,
+                    last_updated TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS meta_sequences (
+                    seq_key TEXT PRIMARY KEY,
+                    pattern TEXT NOT NULL,
+                    occurrences INTEGER NOT NULL DEFAULT 0,
+                    successes INTEGER NOT NULL DEFAULT 0,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS predictions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_at TEXT NOT NULL,
+                    current_tool TEXT NOT NULL,
+                    predicted_tool TEXT NOT NULL,
+                    confidence REAL NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'proposed',
+                    consumed_at TEXT
+                );
+                CREATE TABLE IF NOT EXISTS orphan_events (
+                    event_id TEXT PRIMARY KEY,
+                    tool_call_id TEXT NOT NULL,
+                    tool TEXT NOT NULL,
+                    pre_ts TEXT NOT NULL,
+                    marked_at TEXT NOT NULL
+                );
             """
             )
             conn.commit()
             self._migrate(conn)
+            conn.execute(
+                "INSERT INTO schema_meta (key, value) VALUES ('schema_version', ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (str(SCHEMA_VERSION),),
+            )
+            conn.commit()
             conn.executescript(
                 """
                 CREATE INDEX IF NOT EXISTS idx_sync_queue_timestamp
@@ -219,7 +280,11 @@ class FederatedDB:
                     ON sync_queue(event_id) WHERE event_id != '';
                 CREATE INDEX IF NOT EXISTS idx_sync_queue_trace_id
                     ON sync_queue(trace_id);
-            """
+                CREATE INDEX IF NOT EXISTS idx_sync_queue_tool_call_id
+                    ON sync_queue(tool_call_id);
+                CREATE INDEX IF NOT EXISTS idx_predictions_tool
+                    ON predictions(current_tool, status);
+                """
             )
             conn.commit()
         finally:
@@ -232,6 +297,10 @@ class FederatedDB:
     # ------------------------------------------------------------------ #
     def enqueue_to_buffer(self, event_id, trace_id, tool_call_id, event_type, payload):
         import json as _json
+        try:
+            payload = sanitize(payload)
+        except Exception:
+            pass
         if isinstance(payload, dict):
             payload = _json.dumps(payload)
         conn = self._get_conn()
@@ -620,6 +689,8 @@ class FederatedDB:
     # Public sync API (backward compatible)
     # ------------------------------------------------------------------ #
     def push(self, payload: dict, node_id: str = "local") -> int:
+        payload = sanitize(payload)
+
         def _do_push(conn=None):
             created_here = conn is None
             if created_here:
@@ -688,7 +759,10 @@ class FederatedDB:
         """Enqueue a telemetry event for batched persistence.
 
         Returns the event_id on success, or None if the queue is full.
+        The payload is sanitized (secrets redacted) before anything is
+        buffered or queued, so plaintext secrets never reach SQLite.
         """
+        payload = sanitize(payload)
         if self._shutdown.is_set():
             with self._counters_lock:
                 self._counters["events_dropped"] += 1
@@ -991,6 +1065,7 @@ class FederatedDB:
     # Async wrappers
     # ------------------------------------------------------------------ #
     def _enqueue_durable(self, payload: dict, node_id: str = "local"):
+        payload = sanitize(payload)
         event_id = payload.get("event_id") or self._generate_event_id()
         trace_id = payload.get("trace_id") or self._generate_trace_id()
         tool_call_id = payload.get("tool_call_id") or ""
@@ -1025,6 +1100,345 @@ class FederatedDB:
     async def async_prune(self) -> dict[str, Any]:
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(_EXECUTOR, self.prune)
+
+
+    # ------------------------------------------------------------------ #
+    # v0.23 persistent learning / predictions / orphans
+    # ------------------------------------------------------------------ #
+    def get_schema_version(self) -> str:
+        conn = self._get_conn()
+        try:
+            row = conn.execute(
+                "SELECT value FROM schema_meta WHERE key='schema_version'"
+            ).fetchone()
+            return row[0] if row else "1"
+        finally:
+            conn.close()
+
+    def save_feedback(self, rows: list[dict[str, Any]]) -> int:
+        """Idempotent upsert of per-tool EMA state. Returns rows written."""
+        if not rows:
+            return 0
+        now = datetime.now(timezone.utc).isoformat()
+        conn = self._get_conn()
+        try:
+            conn.execute("BEGIN")
+            for r in rows:
+                conn.execute(
+                    "INSERT INTO tool_feedback (tool, score, samples, successes,"
+                    " failures, updated_at) VALUES (?, ?, ?, ?, ?, ?)"
+                    " ON CONFLICT(tool) DO UPDATE SET score=excluded.score,"
+                    " samples=excluded.samples, successes=excluded.successes,"
+                    " failures=excluded.failures, updated_at=excluded.updated_at",
+                    (str(r["tool"]), float(r["score"]), int(r["samples"]),
+                     int(r.get("successes", 0)), int(r.get("failures", 0)), now),
+                )
+            conn.commit()
+            return len(rows)
+        finally:
+            conn.close()
+
+    def load_feedback(self) -> list[dict[str, Any]]:
+        conn = self._get_conn()
+        try:
+            return [
+                {"tool": r[0], "score": r[1], "samples": r[2],
+                 "successes": r[3], "failures": r[4]}
+                for r in conn.execute(
+                    "SELECT tool, score, samples, successes, failures"
+                    " FROM tool_feedback"
+                ).fetchall()
+            ]
+        finally:
+            conn.close()
+
+    def save_transitions(self, rows: list[dict[str, Any]]) -> int:
+        """Idempotent upsert of Markov transition counts."""
+        if not rows:
+            return 0
+        now = datetime.now(timezone.utc).isoformat()
+        conn = self._get_conn()
+        try:
+            conn.execute("BEGIN")
+            for r in rows:
+                conn.execute(
+                    "INSERT INTO tool_transitions (prev_key, next_tool, count,"
+                    " updated_at) VALUES (?, ?, ?, ?)"
+                    " ON CONFLICT(prev_key, next_tool) DO UPDATE"
+                    " SET count=excluded.count, updated_at=excluded.updated_at",
+                    (str(r["prev_key"]), str(r["next_tool"]), int(r["count"]), now),
+                )
+            conn.commit()
+            return len(rows)
+        finally:
+            conn.close()
+
+    def load_transitions(self) -> list[dict[str, Any]]:
+        conn = self._get_conn()
+        try:
+            return [
+                {"prev_key": r[0], "next_tool": r[1], "count": r[2]}
+                for r in conn.execute(
+                    "SELECT prev_key, next_tool, count FROM tool_transitions"
+                ).fetchall()
+            ]
+        finally:
+            conn.close()
+
+    def prune_transitions(self, keep_top_per_key: int = 20) -> int:
+        """Bound transition table growth: keep top-N targets per prev_key."""
+        conn = self._get_conn()
+        try:
+            cur = conn.execute(
+                "DELETE FROM tool_transitions WHERE rowid NOT IN ("
+                " SELECT rowid FROM ("
+                "  SELECT rowid, ROW_NUMBER() OVER (PARTITION BY prev_key"
+                "   ORDER BY count DESC) AS rn FROM tool_transitions)"
+                " WHERE rn <= ?)",
+                (keep_top_per_key,),
+            )
+            conn.commit()
+            return cur.rowcount or 0
+        finally:
+            conn.close()
+
+    def save_tool_stats(self, rows: list[dict[str, Any]]) -> int:
+        if not rows:
+            return 0
+        now = datetime.now(timezone.utc).isoformat()
+        conn = self._get_conn()
+        try:
+            conn.execute("BEGIN")
+            for r in rows:
+                conn.execute(
+                    "INSERT INTO meta_tool_stats (tool, calls, fails,"
+                    " total_duration_us, last_updated) VALUES (?, ?, ?, ?, ?)"
+                    " ON CONFLICT(tool) DO UPDATE SET calls=excluded.calls,"
+                    " fails=excluded.fails,"
+                    " total_duration_us=excluded.total_duration_us,"
+                    " last_updated=excluded.last_updated",
+                    (str(r["tool"]), int(r["calls"]), int(r["fails"]),
+                     int(r["total_duration_us"]), now),
+                )
+            conn.commit()
+            return len(rows)
+        finally:
+            conn.close()
+
+    def load_tool_stats(self) -> list[dict[str, Any]]:
+        conn = self._get_conn()
+        try:
+            return [
+                {"tool": r[0], "calls": r[1], "fails": r[2],
+                 "total_duration_us": r[3]}
+                for r in conn.execute(
+                    "SELECT tool, calls, fails, total_duration_us"
+                    " FROM meta_tool_stats"
+                ).fetchall()
+            ]
+        finally:
+            conn.close()
+
+    def save_sequences(self, rows: list[dict[str, Any]]) -> int:
+        if not rows:
+            return 0
+        now = datetime.now(timezone.utc).isoformat()
+        conn = self._get_conn()
+        try:
+            conn.execute("BEGIN")
+            for r in rows:
+                conn.execute(
+                    "INSERT INTO meta_sequences (seq_key, pattern, occurrences,"
+                    " successes, updated_at) VALUES (?, ?, ?, ?, ?)"
+                    " ON CONFLICT(seq_key) DO UPDATE"
+                    " SET occurrences=excluded.occurrences,"
+                    " successes=excluded.successes, updated_at=excluded.updated_at",
+                    (str(r["seq_key"]), str(r["pattern"]),
+                     int(r["occurrences"]), int(r["successes"]), now),
+                )
+            conn.commit()
+            return len(rows)
+        finally:
+            conn.close()
+
+    def load_sequences(self) -> list[dict[str, Any]]:
+        conn = self._get_conn()
+        try:
+            return [
+                {"seq_key": r[0], "pattern": r[1], "occurrences": r[2],
+                 "successes": r[3]}
+                for r in conn.execute(
+                    "SELECT seq_key, pattern, occurrences, successes"
+                    " FROM meta_sequences ORDER BY occurrences DESC LIMIT 500"
+                ).fetchall()
+            ]
+        finally:
+            conn.close()
+
+    def log_prediction(self, current_tool: str, predicted_tool: str,
+                       confidence: float) -> int:
+        conn = self._get_conn()
+        try:
+            cur = conn.execute(
+                "INSERT INTO predictions (created_at, current_tool,"
+                " predicted_tool, confidence, status)"
+                " VALUES (datetime('now'), ?, ?, ?, 'proposed')",
+                (current_tool, predicted_tool, float(confidence)),
+            )
+            conn.commit()
+            pred_id = cur.lastrowid or 0
+            conn.execute(
+                "DELETE FROM predictions WHERE id NOT IN ("
+                " SELECT id FROM predictions ORDER BY id DESC LIMIT 500)"
+            )
+            conn.commit()
+            return pred_id
+        finally:
+            conn.close()
+
+    def get_predictions(self, current_tool: str,
+                        status: str = "proposed") -> list[dict[str, Any]]:
+        conn = self._get_conn()
+        try:
+            return [
+                {"id": r[0], "created_at": r[1], "current_tool": r[2],
+                 "predicted_tool": r[3], "confidence": r[4], "status": r[5]}
+                for r in conn.execute(
+                    "SELECT id, created_at, current_tool, predicted_tool,"
+                    " confidence, status FROM predictions"
+                    " WHERE current_tool=? AND status=? ORDER BY id DESC LIMIT 50",
+                    (current_tool, status),
+                ).fetchall()
+            ]
+        finally:
+            conn.close()
+
+    def set_prediction_status(self, pred_id: int, status: str) -> bool:
+        if status not in ("proposed", "consumed", "invalidated", "expired"):
+            raise ValueError("unknown prediction status: %s" % status)
+        conn = self._get_conn()
+        try:
+            cur = conn.execute(
+                "UPDATE predictions SET status=?,"
+                " consumed_at=CASE WHEN ?= 'consumed'"
+                " THEN datetime('now') ELSE consumed_at END WHERE id=?",
+                (status, status, pred_id),
+            )
+            conn.commit()
+            return (cur.rowcount or 0) > 0
+        finally:
+            conn.close()
+
+    def persist_learner_state(self, feedback_rows, transition_rows,
+                              stat_rows, seq_rows) -> Dict[str, int]:
+        """Write all learner tables over ONE connection/transaction.
+
+        Cheaper than four separate save_* calls from the periodic hook
+        path. All-or-nothing per table group; never raises past caller.
+        """
+        out = {"feedback": 0, "transitions": 0, "stats": 0, "sequences": 0}
+        now = datetime.now(timezone.utc).isoformat()
+        conn = self._get_conn()
+        try:
+            conn.execute("BEGIN")
+            for r in feedback_rows or []:
+                conn.execute(
+                    "INSERT INTO tool_feedback (tool, score, samples, successes,"
+                    " failures, updated_at) VALUES (?, ?, ?, ?, ?, ?)"
+                    " ON CONFLICT(tool) DO UPDATE SET score=excluded.score,"
+                    " samples=excluded.samples, successes=excluded.successes,"
+                    " failures=excluded.failures, updated_at=excluded.updated_at",
+                    (str(r["tool"]), float(r["score"]), int(r["samples"]),
+                     int(r.get("successes", 0)), int(r.get("failures", 0)), now),
+                )
+                out["feedback"] += 1
+            for r in transition_rows or []:
+                conn.execute(
+                    "INSERT INTO tool_transitions (prev_key, next_tool, count,"
+                    " updated_at) VALUES (?, ?, ?, ?)"
+                    " ON CONFLICT(prev_key, next_tool) DO UPDATE"
+                    " SET count=excluded.count, updated_at=excluded.updated_at",
+                    (str(r["prev_key"]), str(r["next_tool"]), int(r["count"]), now),
+                )
+                out["transitions"] += 1
+            for r in stat_rows or []:
+                conn.execute(
+                    "INSERT INTO meta_tool_stats (tool, calls, fails,"
+                    " total_duration_us, last_updated) VALUES (?, ?, ?, ?, ?)"
+                    " ON CONFLICT(tool) DO UPDATE SET calls=excluded.calls,"
+                    " fails=excluded.fails,"
+                    " total_duration_us=excluded.total_duration_us,"
+                    " last_updated=excluded.last_updated",
+                    (str(r["tool"]), int(r["calls"]), int(r["fails"]),
+                     int(r["total_duration_us"]), now),
+                )
+                out["stats"] += 1
+            for r in seq_rows or []:
+                conn.execute(
+                    "INSERT INTO meta_sequences (seq_key, pattern, occurrences,"
+                    " successes, updated_at) VALUES (?, ?, ?, ?, ?)"
+                    " ON CONFLICT(seq_key) DO UPDATE"
+                    " SET occurrences=excluded.occurrences,"
+                    " successes=excluded.successes, updated_at=excluded.updated_at",
+                    (str(r["seq_key"]), str(r["pattern"]),
+                     int(r["occurrences"]), int(r["successes"]), now),
+                )
+                out["sequences"] += 1
+            conn.commit()
+            return out
+        finally:
+            conn.close()
+
+    def find_orphans(self, limit: int = 500) -> list[dict[str, Any]]:
+        """Pre events with no matching post (by tool_call_id).
+
+        Status vocabulary: completed / failed / orphaned / unknown.
+        No durations are invented for orphans.
+        """
+        conn = self._get_conn()
+        try:
+            rows = conn.execute(
+                "SELECT q.tool_call_id, q.tool, q.event_id, q.timestamp"
+                " FROM sync_queue q"
+                " WHERE json_extract(q.payload, '$.hook') = 'pre_tool_call'"
+                " AND q.tool_call_id != ''"
+                " AND NOT EXISTS (SELECT 1 FROM sync_queue p"
+                "  WHERE json_extract(p.payload, '$.hook') = 'post_tool_call'"
+                "  AND p.tool_call_id = q.tool_call_id)"
+                " ORDER BY q.id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+            return [
+                {"tool_call_id": r[0], "tool": r[1], "pre_event_id": r[2],
+                 "pre_ts": r[3], "status": "orphaned"}
+                for r in rows
+            ]
+        finally:
+            conn.close()
+
+    def mark_orphans(self, limit: int = 500) -> int:
+        """Record detected orphans idempotently. Returns newly marked count."""
+        orphans = self.find_orphans(limit=limit)
+        if not orphans:
+            return 0
+        now = datetime.now(timezone.utc).isoformat()
+        conn = self._get_conn()
+        try:
+            conn.execute("BEGIN")
+            added = 0
+            for o in orphans:
+                cur = conn.execute(
+                    "INSERT OR IGNORE INTO orphan_events (event_id,"
+                    " tool_call_id, tool, pre_ts, marked_at)"
+                    " VALUES (?, ?, ?, ?, ?)",
+                    (o["pre_event_id"], o["tool_call_id"], o["tool"],
+                     o["pre_ts"], now),
+                )
+                added += cur.rowcount or 0
+            conn.commit()
+            return added
+        finally:
+            conn.close()
 
 
 # Singleton instance for convenience

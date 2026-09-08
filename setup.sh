@@ -20,7 +20,7 @@
 #                    (e.g. Hermes CLI not installed)
 set -euo pipefail
 
-EXPECTED_VERSION="0.22.2"
+EXPECTED_VERSION="0.23.0"
 PLUGIN_ID="hermes_enhancer"
 
 # [1/6] Locate repository root (directory containing this script).
@@ -34,7 +34,7 @@ echo ""
 
 # [1/6] Checking project files.
 echo "[1/6] Checking project..."
-REQUIRED_FILES="plugin.yaml README.md src/__init__.py src/enhancer.py src/federated_db.py src/feedback_optimizer.py src/predictive_preload.py src/meta_learner.py src/skill_graph.py src/composer.py src/self_test.py"
+REQUIRED_FILES="plugin.yaml README.md src/__init__.py src/enhancer.py src/federated_db.py src/feedback_optimizer.py src/predictive_preload.py src/meta_learner.py src/skill_graph.py src/composer.py src/self_test.py src/redaction.py src/decision_engine.py"
 for f in $REQUIRED_FILES; do
     if [ ! -f "$ROOT_DIR/$f" ]; then
         echo "ERROR: required file missing: $f" >&2
@@ -60,7 +60,7 @@ echo "      plugin directory: $PLUGIN_DIR"
 echo "[3/6] Preparing plugin directory..."
 STAGE="$(mktemp -d "$HERMES_HOME/.${PLUGIN_ID}.stage.XXXXXX" 2>/dev/null || mktemp -d)"
 trap 'rm -rf "$STAGE"' EXIT
-for mod in __init__ enhancer federated_db feedback_optimizer predictive_preload meta_learner skill_graph composer self_test; do
+for mod in __init__ enhancer federated_db feedback_optimizer predictive_preload meta_learner skill_graph composer self_test redaction decision_engine; do
     cp "$ROOT_DIR/src/$mod.py" "$STAGE/$mod.py"
 done
 cp "$ROOT_DIR/plugin.yaml" "$STAGE/plugin.yaml"
@@ -88,7 +88,7 @@ trap - EXIT
 
 # [5/6] Verifying installation from disk (never from memory).
 echo "[5/6] Verifying installation..."
-for mod in __init__ enhancer federated_db feedback_optimizer predictive_preload meta_learner skill_graph composer self_test; do
+for mod in __init__ enhancer federated_db feedback_optimizer predictive_preload meta_learner skill_graph composer self_test redaction decision_engine; do
     if [ ! -f "$PLUGIN_DIR/$mod.py" ]; then
         echo "ERROR: installed file missing: $mod.py" >&2
         exit 1

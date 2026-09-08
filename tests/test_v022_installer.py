@@ -20,6 +20,7 @@ EXPECTED_FILES = {
     "__init__.py", "enhancer.py", "federated_db.py",
     "feedback_optimizer.py", "predictive_preload.py", "meta_learner.py",
     "skill_graph.py", "composer.py", "self_test.py",
+    "redaction.py", "decision_engine.py",
     "plugin.yaml", "README.md",
 }
 FORBIDDEN = (".git", "__pycache__", ".pyc", ".pytest_cache", ".venv")
@@ -46,9 +47,9 @@ def test_a_fresh_install(tmp_path):
     proc = run(SETUP, home)
     assert proc.returncode == 0, proc.stderr
     assert "Plugin installation: PASS" in proc.stdout
-    assert "Plugin version: 0.22.2" in proc.stdout
+    assert "Plugin version: 0.23.0" in proc.stdout
     assert installed_files(home) == EXPECTED_FILES
-    assert "version: 0.22.2" in open(
+    assert "version: 0.23.0" in open(
         os.path.join(plugin_dir(home), "plugin.yaml")).read()
     for bad in FORBIDDEN:
         assert not any(bad in f for f in installed_files(home)), bad
@@ -62,7 +63,7 @@ def test_b_repeated_install_idempotent(tmp_path):
     assert installed_files(home) == EXPECTED_FILES
     nested = os.path.join(plugin_dir(home), "hermes_enhancer")
     assert not os.path.exists(nested), "nested plugin directory created"
-    assert "version: 0.22.2" in open(
+    assert "version: 0.23.0" in open(
         os.path.join(plugin_dir(home), "plugin.yaml")).read()
 
 
@@ -78,7 +79,7 @@ def test_c_upgrade_from_old_version(tmp_path):
     assert proc.returncode == 0, proc.stderr
     assert "updating safely" in proc.stdout
     assert installed_files(home) == EXPECTED_FILES
-    assert "version: 0.22.2" in open(
+    assert "version: 0.23.0" in open(
         os.path.join(old, "plugin.yaml")).read()
     backups = [f for f in os.listdir(os.path.join(home, "plugins"))
                if f.startswith(".hermes_enhancer.bak.")]

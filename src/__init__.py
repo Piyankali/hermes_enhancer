@@ -11,16 +11,25 @@ from .predictive_preload import PredictivePreload
 from .meta_learner import MetaLearner
 from .skill_graph import SkillGraph
 from .composer import SkillComposer
+from .decision_engine import DecisionEngine
+from .redaction import sanitize, REDACTED
 
 _instance: Optional[HermesEnhancer] = None
 _pending_pre: Dict[str, float] = {}
+_startup_report: Optional[Dict[str, Any]] = None
 
 
 def register(ctx) -> None:
     """Register the enhancer plugin and bind pre/post tool hooks into Hermes runtime."""
-    global _instance
+    global _instance, _startup_report
     enhancer = HermesEnhancer(node_id=getattr(ctx, "node_id", None) or "local")
     _instance = enhancer
+    # Lightweight, non-blocking startup check (fast local queries only).
+    # Never raises, never repairs, never blocks hook registration.
+    try:
+        _startup_report = enhancer.startup_check()
+    except Exception:
+        _startup_report = {"status": "FAIL", "checks": {}}
 
     def _on_pre_tool_call(
         tool_name: str = "",
@@ -100,3 +109,21 @@ def hooks() -> Dict[str, Callable]:
         "pre_tool_call": enhancer.pre_tool_call,
         "post_tool_call": enhancer.on_post_tool_call,
     }
+
+
+def startup_report() -> Dict[str, Any]:
+    """Return the lightweight startup health check (PASS/WARN/FAIL)."""
+    if _startup_report is None:
+        return get_instance().startup_check()
+    return _startup_report
+
+
+def recommend(candidates, context_tool=None) -> Dict[str, Any]:
+    """Decision-engine ranking over learned state (advisory only)."""
+    return get_instance().decision.recommend(
+        list(candidates), context_tool=context_tool)
+
+
+def persist_learners() -> Dict[str, Any]:
+    """Flush learner state to SQLite (best-effort)."""
+    return get_instance().persist_learners()
